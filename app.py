@@ -149,6 +149,7 @@ async def start_run(
     judge: str = Form("local"),
     max_side: int = Form(0),
     num_ctx: int = Form(32768),
+    seed: int = Form(1234),
 ) -> dict:
     if not request.strip():
         raise HTTPException(400, "describe the edit you want")
@@ -170,6 +171,7 @@ async def start_run(
         judge_model=judge_model,
         max_side=max_side or None,
         num_ctx=num_ctx,
+        seed=seed,
     )
 
     RUN_STATE[run_id] = {
