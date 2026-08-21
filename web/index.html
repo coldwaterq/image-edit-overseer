@@ -45,6 +45,14 @@
   }
   header h1 { margin: 0; font-size: 19px; letter-spacing: -.01em; font-weight: 640; }
   header p { margin: 0; color: var(--muted); font-size: 13.5px; }
+  .runs { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+  .runs select {
+    max-width: 380px; padding: 7px 10px; border: 1px solid var(--line);
+    border-radius: 9px; background: var(--panel); color: var(--ink);
+    font: inherit; font-size: 13px;
+  }
+  button.tiny { width: auto; padding: 6px 10px; font-size: 14px; line-height: 1; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 
   .wrap {
     display: grid; grid-template-columns: 340px minmax(0,1fr);
@@ -139,6 +147,39 @@
   ul.issues li { margin-bottom: 6px; }
   .none { color: var(--good); font-size: 13.5px; font-weight: 560; }
 
+  .col { min-width: 0; }
+  .crit-panel { margin-bottom: 20px; }
+  .crit-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .crit-head h3 { margin: 0; font-size: 15px; font-weight: 640; }
+  .crit-sub { font-size: 12.5px; color: var(--muted); }
+  #critList { margin: 0; padding-left: 22px; }
+  #critList li { margin-bottom: 8px; font-size: 14px; }
+  #critList li .ctext {
+    display: block; width: 100%; border: 1px solid transparent; border-radius: 7px;
+    padding: 5px 8px; background: transparent; color: var(--ink); font: inherit;
+    font-size: 14px; resize: vertical; min-height: 2.2em;
+  }
+  #critList li .ctext:focus { border-color: var(--accent); background: var(--bg); outline: none; }
+  #critList li .ctext:hover { border-color: var(--line); }
+  .crow { display: flex; align-items: flex-start; gap: 6px; }
+  .drop-crit {
+    border: 0; background: transparent; color: var(--muted); cursor: pointer;
+    font-size: 17px; line-height: 1; padding: 4px 6px; width: auto; border-radius: 6px;
+  }
+  .drop-crit:hover { color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, transparent); }
+  .crit-actions { display: flex; gap: 10px; margin-top: 12px; }
+  .crit-actions button { width: auto; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  button.ghost:hover { border-color: var(--accent); }
+  .added { font-size: 12.5px; color: var(--accent); margin-top: 3px; }
+
+  ul.checks { margin: 0 0 12px; padding: 0; list-style: none; font-size: 13.5px; }
+  ul.checks li { display: flex; gap: 8px; margin-bottom: 7px; align-items: flex-start; }
+  .mark { flex: none; font-weight: 700; font-size: 12px; line-height: 1.5; }
+  .mark.ok { color: var(--good); }
+  .mark.no { color: var(--bad); }
+  .cnote { color: var(--muted); font-size: 12.5px; display: block; }
+
   .final { border-color: var(--accent); }
   .final .card-head { background: var(--accent-soft); }
   .working { display: flex; align-items: center; gap: 9px; padding: 15px 17px; color: var(--muted); font-size: 13.5px; }
@@ -149,6 +190,11 @@
 <header>
   <h1>image-edit-overseer</h1>
   <p>Describe the edit. A local model writes the prompt, grades the result, and tries again until it&rsquo;s right.</p>
+  <div class="runs">
+    <label for="runPicker" class="sr">Runs</label>
+    <select id="runPicker"><option value="">New run</option></select>
+    <button type="button" id="refreshRuns" class="ghost tiny" title="Refresh">&#8635;</button>
+  </div>
 </header>
 
 <div class="wrap">
@@ -168,7 +214,7 @@
 
     <div class="field">
       <label for="max_iters">Max attempts &mdash; <span id="itersOut">5</span></label>
-      <input type="range" id="max_iters" min="1" max="12" value="5" class="slider">
+      <input type="range" id="max_iters" min="1" max="100" value="5" class="slider">
       <div class="hint">Each attempt is one render plus one critique.</div>
     </div>
 
@@ -189,7 +235,9 @@
       </div>
       <div class="field">
         <label for="max_side">Max pixels (longest edge)</label>
-        <input type="number" id="max_side" value="1024" min="256" max="2048" step="64">
+        <input type="number" id="max_side" value="" min="0" max="2048" step="64"
+               placeholder="auto — from your image">
+        <div class="hint">Blank derives it from the source, capped at 2048.</div>
       </div>
       <div class="field">
         <label for="judge_model">Judge (Ollama)</label>
@@ -203,13 +251,28 @@
     <div id="status"></div>
   </form>
 
+  <div class="col">
+  <section class="panel crit-panel" id="critPanel" hidden>
+    <div class="crit-head">
+      <h3>What counts as done</h3>
+      <span class="crit-sub" id="critSub"></span>
+    </div>
+    <ol id="critList"></ol>
+    <div class="crit-actions" id="critActions" hidden>
+      <button type="button" id="addCrit" class="ghost">+ Add requirement</button>
+      <button type="button" id="again">Try again with these</button>
+    </div>
+  </section>
   <main id="feed"><div class="panel empty">Nothing yet &mdash; add an image and describe the edit.</div></main>
+</div>
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
 const drop = $('drop'), file = $('file'), feed = $('feed'), go = $('go'),
-      stop = $('stop'), status = $('status');
+      stop = $('stop'), status = $('status'), critPanel = $('critPanel'),
+      runPicker = $('runPicker'),
+      critList = $('critList'), critActions = $('critActions'), critSub = $('critSub');
 let picked = null, activeRun = null, stopping = false;
 
 function refresh() { go.disabled = !(picked && $('request').value.trim()) || !stop.hidden; }
@@ -274,35 +337,87 @@ function cardFor(n) {
   return el;
 }
 
+function critRow(text) {
+  const li = document.createElement('li');
+  const row = document.createElement('div');
+  row.className = 'crow';
+  const ta = document.createElement('textarea');
+  ta.className = 'ctext'; ta.rows = 1; ta.value = text;
+  ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = ta.scrollHeight + 'px'; });
+  const del = document.createElement('button');
+  del.type = 'button'; del.className = 'drop-crit'; del.textContent = '×';
+  del.title = 'Remove this requirement';
+  del.addEventListener('click', () => li.remove());
+  row.append(ta, del); li.append(row);
+  return li;
+}
+
+function showCriteria(list, editable, sub) {
+  critPanel.hidden = false;
+  critList.innerHTML = '';
+  list.forEach(c => critList.appendChild(critRow(c)));
+  critSub.textContent = sub || '';
+  critActions.hidden = !editable;
+  critList.querySelectorAll('.ctext').forEach(t => {
+    t.style.height = 'auto'; t.style.height = t.scrollHeight + 'px';
+    t.readOnly = !editable;
+  });
+}
+
+function readCriteria() {
+  return [...critList.querySelectorAll('.ctext')].map(t => t.value.trim()).filter(Boolean);
+}
+
+$('addCrit').addEventListener('click', () => {
+  const li = critRow('');
+  critList.appendChild(li);
+  li.querySelector('.ctext').focus();
+});
+
 function badgeClass(score) { return score >= 8 ? 'good' : score >= 5 ? 'warn' : 'bad'; }
 
-$('form').addEventListener('submit', async e => {
-  e.preventDefault();
-  running(true);
-  feed.innerHTML = '';
-  setStatus('Starting&hellip;', true);
-
-  const fd = new FormData();
-  fd.append('image', picked);
-  fd.append('request', $('request').value.trim());
-  for (const k of ['max_iters', 'editor', 'flux_size', 'judge_model', 'max_side'])
-    fd.append(k, $(k).value);
-
-  let runId;
+async function loadRuns(selected) {
   try {
-    const res = await fetch('/api/run', { method: 'POST', body: fd });
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    runId = (await res.json()).run_id;
-    activeRun = runId;
-  } catch (err) {
-    setStatus('Failed: ' + err.message, false); running(false); return;
-  }
+    const { runs } = await (await fetch('/api/runs')).json();
+    const keep = selected || runPicker.value;
+    runPicker.innerHTML = '<option value="">New run</option>';
+    for (const r of runs) {
+      const o = document.createElement('option');
+      o.value = r.run_id;
+      const mark = r.running ? '● ' : (r.satisfied ? '✓ ' : '');
+      const what = r.request ? r.request.slice(0, 60) : '(no description)';
+      o.textContent = `${mark}${what}${r.attempts ? ` — ${r.attempts} attempt${r.attempts>1?'s':''}` : ''}`;
+      runPicker.appendChild(o);
+    }
+    if (keep) runPicker.value = keep;
+  } catch { /* listing is a convenience; ignore failures */ }
+}
 
+$('refreshRuns').addEventListener('click', () => loadRuns());
+
+runPicker.addEventListener('change', () => {
+  const id = runPicker.value;
+  feed.innerHTML = '';
+  critPanel.hidden = true;
+  if (!id) { activeRun = null; setStatus('', false); running(false); refresh(); return; }
+  activeRun = id;
+  setStatus('Loading run…', true);
+  listen(id);
+});
+
+function listen(runId) {
   const src = new EventSource('/api/stream/' + runId);
   src.onmessage = ev => {
     const d = JSON.parse(ev.data);
     if (d.type === 'start') {
       setStatus(`${d.editor} &middot; judged by ${d.judge}`, true);
+    } else if (d.type === 'criteria') {
+      showCriteria(d.criteria, false, d.edited ? 'your requirements' : 'drafted from your request');
+      setStatus('Decided what counts as done. Writing a prompt&hellip;', true);
+    } else if (d.type === 'replan') {
+      const el = cardFor(d.iteration);
+      el.dataset.prompt = d.prompt;
+      setStatus('Steering to your requirements&hellip;', true);
     } else if (d.type === 'plan') {
       const el = cardFor(d.iteration);
       el.dataset.prompt = d.prompt;
@@ -334,9 +449,25 @@ $('form').addEventListener('submit', async e => {
       b.innerHTML = d.score + '/10' + (d.satisfied ? ' &middot; accepted' : '');
       b.className = 'badge ' + badgeClass(d.score);
       const crit = el.querySelector('.crit');
-      crit.innerHTML = d.issues && d.issues.length
-        ? '<ul class="issues">' + d.issues.map(i => `<li>${esc(i)}</li>`).join('') + '</ul>'
-        : '<span class="none">No issues found.</span>';
+      let html = '';
+      if (d.checks && d.checks.length) {
+        html += '<ul class="checks">' + d.checks.map(c =>
+          `<li><span class="mark ${c.met ? 'ok' : 'no'}">${c.met ? '✓' : '✗'}</span>` +
+          `<span>${esc(c.criterion)}` +
+          (c.note ? `<span class="cnote">${esc(c.note)}</span>` : '') +
+          `</span></li>`).join('') + '</ul>';
+      }
+      if (d.drift && d.drift.length) {
+        html += '<h4>Drifted</h4><ul class="issues">' +
+          d.drift.map(i => `<li>${esc(i)}</li>`).join('') + '</ul>';
+      }
+      if (!html) html = '<span class="none">Everything checked out.</span>';
+      if (d.added_criteria && d.added_criteria.length) {
+        html += '<div class="added">+ locked in: ' +
+          d.added_criteria.map(esc).join('; ') + '</div>';
+      }
+      crit.innerHTML = html;
+      if (d.criteria) showCriteria(d.criteria, false, 'updated as drift was found');
       if (d.satisfied) el.classList.add('final');
     } else if (d.type === 'revised') {
       const el = cardFor(d.iteration + 1);
@@ -346,9 +477,13 @@ $('form').addEventListener('submit', async e => {
       setStatus(d.satisfied
         ? `Accepted after ${d.iterations} attempt${d.iterations > 1 ? 's' : ''}.`
         : `Stopped after ${d.iterations} without a pass — best ${d.best_score}/10.`, false);
+      if (d.criteria) showCriteria(d.criteria, true,
+        'edit these to say what you actually wanted, then try again');
       running(false);
     } else if (d.type === 'stopped') {
-      setStatus('Stopped. Attempts so far are kept below.', false);
+      setStatus('Stopped. Edit the requirements and try again when ready.', false);
+      critActions.hidden = false;
+      critList.querySelectorAll('.ctext').forEach(t => { t.readOnly = false; });
       document.querySelectorAll('.card .working').forEach(w => {
         w.innerHTML = '<span>Cancelled before this attempt finished.</span>';
         w.closest('.card').classList.add('stopped');
@@ -359,11 +494,58 @@ $('form').addEventListener('submit', async e => {
       running(false);
     } else if (d.type === 'close') {
       src.close();
-      activeRun = null;
       running(false);
+      loadRuns(runId);
     }
   };
   src.onerror = () => { setStatus('Connection lost.', false); src.close(); running(false); };
+}
+
+$('again').addEventListener('click', async () => {
+  if (!activeRun) return;
+  const list = readCriteria();
+  if (!list.length) { setStatus('Keep at least one requirement.', false); return; }
+  const fd = new FormData();
+  fd.append('criteria', JSON.stringify(list));
+  fd.append('max_iters', $('max_iters').value);
+  running(true);
+  setStatus('Continuing from the last attempt&hellip;', true);
+  try {
+    const res = await fetch('/api/continue/' + activeRun, { method: 'POST', body: fd });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    listen(activeRun);
+  } catch (err) {
+    setStatus('Failed: ' + err.message, false);
+    running(false);
+  }
+});
+
+loadRuns();
+
+$('form').addEventListener('submit', async e => {
+  e.preventDefault();
+  running(true);
+  feed.innerHTML = '';
+  setStatus('Starting&hellip;', true);
+
+  const fd = new FormData();
+  fd.append('image', picked);
+  fd.append('request', $('request').value.trim());
+  for (const k of ['max_iters', 'editor', 'flux_size', 'judge_model', 'max_side'])
+    fd.append(k, $(k).value);
+
+  let runId;
+  try {
+    const res = await fetch('/api/run', { method: 'POST', body: fd });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    runId = (await res.json()).run_id;
+    activeRun = runId;
+    loadRuns(runId);
+  } catch (err) {
+    setStatus('Failed: ' + err.message, false); running(false); return;
+  }
+
+  listen(runId);
 });
 </script>
 </body>

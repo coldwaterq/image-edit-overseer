@@ -25,7 +25,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -49,15 +49,50 @@ PLAN_SCHEMA = {
     "required": ["prompt", "reasoning"],
 }
 
+# The judge used to be asked "what is wrong with this?" and would answer with
+# whatever it noticed first -- reliably colour and style, rarely geometry. A
+# request like "run the gate from that post to the near side" was graded 10/10
+# with the gate not touching the post at all: it verified that a post existed
+# and a gate existed, never that they met. Deciding what must be true BEFORE
+# seeing the result, then forcing a verdict on each item, is what stops the
+# judge from grading only the axis it finds easy.
+CRITERIA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "criteria": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["criteria"],
+}
+
 CRITIQUE_SCHEMA = {
     "type": "object",
     "properties": {
-        "satisfied": {"type": "boolean"},
+        "checks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "criterion": {"type": "string"},
+                    "met": {"type": "boolean"},
+                    "note": {"type": "string"},
+                },
+                "required": ["criterion", "met", "note"],
+            },
+        },
+        "drift": {"type": "array", "items": {"type": "string"}},
+        "new_criteria": {"type": "array", "items": {"type": "string"}},
         "score": {"type": "integer"},
-        "issues": {"type": "array", "items": {"type": "string"}},
+        "satisfied": {"type": "boolean"},
         "revised_prompt": {"type": "string"},
     },
-    "required": ["satisfied", "score", "issues", "revised_prompt"],
+    "required": [
+        "checks",
+        "drift",
+        "new_criteria",
+        "score",
+        "satisfied",
+        "revised_prompt",
+    ],
 }
 
 
@@ -78,44 +113,112 @@ Rules:
 - One prompt. No alternatives, no commentary outside the JSON.
 """
 
-CRITIQUE_SYSTEM = """\
-You are grading an image edit for {editor_name}.
+CRITIQUE_SYSTEM = """You are grading an image edit for {editor_name}.
 
 {layout}
 
-Judge only whether the edited image satisfies the user's request while keeping
-everything the user did not ask to change.
+You are given acceptance criteria that were written BEFORE this image was
+generated. Rule on each one: does the edited image satisfy it, yes or no?
+
+Answer the criterion you were given, not one you find easier to check, and
+never skip one because it is hard to see. If a criterion is about two things
+touching, connecting or spanning, look at the exact place they should meet and
+say in the note what is actually there -- a join, or a gap, and roughly how
+big. "There is a post and there is a gate" does not answer whether they meet.
+
+Then, separately, list anything that visibly drifted which was not asked for.
+
+For each thing that drifted, also write a criterion that would have caught it,
+so it cannot come back. Phrase it as a fact about the finished picture, not an
+instruction: "the gate is a solid wooden panel, not horizontal rails with gaps"
+rather than "do not change the gate style". These are added to the criteria
+permanently and every later attempt is graded against them too, which is what
+stops the picture wandering away from the original one fix at a time, or
+flipping back and forth between two wrong versions.
+
+Only add a criterion for something that actually drifted in THIS image. Do not
+restate a criterion you already have, and do not invent guards for things that
+are still fine.
 
 The editor regenerates every pixel, so a faithful edit still shifts colours a
-little everywhere. That is reconstruction noise, not a defect. Judge what a
-person would notice with the two pictures in front of them, at a glance:
+little everywhere. That is reconstruction noise, not a defect:
+- IGNORE slight shifts in shade, brightness or saturation. Never list these.
+- REPORT what a person would see: something added, removed, moved or reshaped;
+  a colour changed enough to have a different name; text altered; style
+  visibly changed.
 
-- IGNORE slight shifts in shade, brightness or saturation — "light beige to
-  very light beige", "gray to slightly lighter gray", mild warmth or contrast
-  changes. These are never issues and must never be listed.
-- REPORT changes a person would actually see: an object added, removed, moved
-  or reshaped; a colour changed enough to be called a different colour (green
-  hills turning grey); text altered; identity or style visibly changed.
+Score against the criteria:
+- 1-2: no criterion met; the requested change did not happen.
+- 3-5: some criteria met, some not.
+- 6-7: every criterion met, but something visibly drifted.
+- 8-10: every criterion met and nothing else visibly changed.
 
-Score against what was asked, in this order:
-- 1-2: the requested change did not happen at all.
-- 3-5: it happened, but is wrong or incomplete, or something else visibly
-  drifted.
-- 6-7: the request is met and drift is minor but noticeable.
-- 8-10: the request is met and nothing else visibly changed.
-
-- "satisfied" is true at 8 or above — the request is met and a person would
-  not point at anything else and ask what happened to it. Do not withhold it
-  over shade differences; if the edit is right and nothing visibly drifted,
-  say so and stop.
-- "issues" lists only what you would actually report at those thresholds.
-  Empty is the correct answer for a good edit.
-- "revised_prompt" is a full replacement prompt that fixes the issues. Change
-  the wording that failed rather than restating it louder, and keep the parts
-  that worked. If satisfied is true, repeat the prompt that worked.
+- "checks" has one entry per criterion, in the order given: the criterion
+  repeated, met true or false, and a note saying what you actually see there.
+- "drift" lists unrequested visible changes. Empty is correct for a good edit.
+- "new_criteria" holds one new criterion per drifted item, phrased as a fact
+  about the finished picture. Empty when nothing drifted.
+- "satisfied" is true only when every criterion is met and nothing visibly
+  drifted. An image that looks good but fails a criterion is not satisfied.
+- "revised_prompt" is a full replacement prompt that fixes what failed. Target
+  the criteria that came back false, change the wording that did not work
+  rather than restating it louder, and keep what did. If satisfied, repeat the
+  prompt that worked.
 
 Respond with JSON only.
 """
+
+CRITERIA_SYSTEM = """You are about to supervise an image edit. Before anything is
+generated, write down what must be true of the finished picture for the
+request to count as done.
+
+You get the original image and the request.
+
+Write 2 to 5 criteria. Each one must be a single fact a person could confirm
+or refute by looking at the result, with no judgement call.
+
+Cover what the request actually asks for, especially:
+- WHERE things are, relative to other things ("the post stands between the
+  wall and the driveway, not beside the wall").
+- Whether things TOUCH, connect, span or attach ("the left end of the gate
+  meets the post, with no gap between them"). Requests about moving or
+  rearranging structures usually hinge on this, and it is the easiest thing
+  to overlook because a picture can contain both objects and still be wrong.
+- COUNT and EXTENT ("there is exactly one gate", "the gate reaches all the
+  way across the opening").
+- Anything the request says to leave alone.
+
+Do not write criteria about colour, sharpness or style unless the request
+asks for them. Do not restate the request as one vague criterion. Split it
+into the separate things that must independently hold.
+
+Respond with JSON only.
+"""
+
+
+REPLAN_SYSTEM = """You are correcting a prompt for {editor_name}, an instruction-following
+image editor.
+
+An earlier prompt produced the current result. A person has since reviewed the
+acceptance criteria and edited them -- adding what was missing, removing what
+was wrong, rewording what did not say what they meant. Write the next prompt.
+
+{layout}
+
+The criteria you are given are the specification. They are what the person
+actually wants, and they override the original request, the earlier prompt,
+and your own reading of the image. Do not argue with them or soften them.
+
+Rules:
+- Aim the prompt at the criteria that the current result fails, and keep the
+  wording that already satisfies the others. You are steering, not restarting.
+- Be concrete. If a criterion says two things must meet with no gap, say in
+  the prompt where they meet.
+- Still name what must stay unchanged, including whatever is already right.
+- Describe the desired FINAL image, not the act of editing it.
+- One prompt. No alternatives, no commentary outside the JSON.
+"""
+
 
 # Ollama surfaces only one image per request, so the pair is composited into a
 # single labelled canvas. That introduces its own trap: the model starts
@@ -195,6 +298,22 @@ def extract_json(text: str) -> dict[str, Any]:
                     except json.JSONDecodeError:
                         break
     raise ValueError(f"no JSON object in model response:\n{text[:800]}")
+
+
+# Rendering above this costs VRAM and time steeply, and the editors were not
+# trained for it. Photos come in far larger; there is no point rendering above
+# the source either, so the derived size is the smaller of the two.
+MAX_SIDE_CAP = 2048
+
+
+def auto_max_side(img: Image.Image, cap: int = MAX_SIDE_CAP) -> int:
+    """Longest edge to render at, derived from the source.
+
+    A fixed default silently downscales a phone photo by 4x before the editor
+    ever sees it, which loses exactly the fine structure the judge is asked to
+    check.
+    """
+    return max(min(max(img.size), cap), 256)
 
 
 def composite_pair(before: Image.Image, after: Image.Image, max_side: int = 768) -> Image.Image:
@@ -279,11 +398,26 @@ class Plan:
 
 
 @dataclass
+class Check:
+    criterion: str
+    met: bool
+    note: str
+
+
+@dataclass
 class Verdict:
     satisfied: bool
     score: int
-    issues: list[str]
+    checks: list[Check]
+    drift: list[str]
+    new_criteria: list[str]
     revised_prompt: str
+
+    @property
+    def issues(self) -> list[str]:
+        """Everything wrong, for display: failed criteria first, then drift."""
+        failed = [f"{c.criterion} - {c.note}" for c in self.checks if not c.met]
+        return failed + list(self.drift)
 
 
 class Judge:
@@ -301,7 +435,47 @@ class Judge:
         request: str,
         prompt: str,
         editor: "Editor",
+        criteria: list[str],
     ) -> Verdict:
+        raise NotImplementedError
+
+    def criteria(self, source: Image.Image, request: str) -> list[str]:
+        raise NotImplementedError
+
+    def _verdict(self, data: dict) -> Verdict:
+        """Build a Verdict, enforcing the rules in code rather than trusting.
+
+        A model that reports a criterion unmet and then sets satisfied anyway
+        is common enough that the conjunction has to be recomputed here.
+        """
+        checks = [
+            Check(
+                criterion=str(c.get("criterion", "")),
+                met=bool(c.get("met")),
+                note=str(c.get("note", "")),
+            )
+            for c in data.get("checks", [])
+        ]
+        drift = [str(d) for d in data.get("drift", [])]
+        satisfied = bool(data.get("satisfied")) and all(c.met for c in checks) and not drift
+        return Verdict(
+            satisfied=satisfied,
+            score=int(data.get("score", 0)),
+            checks=checks,
+            drift=drift,
+            new_criteria=[str(c) for c in data.get("new_criteria", [])],
+            revised_prompt=str(data.get("revised_prompt", "")).strip(),
+        )
+
+    def replan(
+        self,
+        source: Image.Image,
+        current: Image.Image,
+        request: str,
+        criteria: list[str],
+        prior_prompt: str,
+        editor: "Editor",
+    ) -> Plan:
         raise NotImplementedError
 
     def release(self) -> None:
@@ -388,21 +562,42 @@ class OllamaJudge(Judge):
         )
         return Plan(prompt=data["prompt"].strip(), reasoning=data.get("reasoning", "").strip())
 
-    def critique(self, source, candidate, request, prompt, editor):
+    def critique(self, source, candidate, request, prompt, editor, criteria):
+        listed = "\n".join(f"{n}. {c}" for n, c in enumerate(criteria, 1))
         data = self._chat(
             CRITIQUE_SYSTEM.format(editor_name=editor.display, layout=LAYOUT_PANELS),
             f"The user asked for:\n\n{request}\n\n"
             f"The prompt used was:\n\n{prompt}\n\n"
-            "Grade the RIGHT panel against the LEFT panel.",
+            f"Acceptance criteria:\n{listed}\n\n"
+            "Grade the RIGHT panel against the LEFT panel, ruling on each "
+            "criterion in order.",
             [composite_pair(source, candidate)],
             CRITIQUE_SCHEMA,
         )
-        return Verdict(
-            satisfied=bool(data["satisfied"]),
-            score=int(data["score"]),
-            issues=[str(i) for i in data.get("issues", [])],
-            revised_prompt=str(data["revised_prompt"]).strip(),
+        return self._verdict(data)
+
+    def criteria(self, source, request, editor=None):
+        data = self._chat(
+            CRITERIA_SYSTEM,
+            f"The request is:\n\n{request}\n\n"
+            "This is the image it will be applied to. Write the criteria.",
+            [source],
+            CRITERIA_SCHEMA,
         )
+        return [str(c).strip() for c in data.get("criteria", []) if str(c).strip()]
+
+    def replan(self, source, current, request, criteria, prior_prompt, editor):
+        data = self._chat(
+            REPLAN_SYSTEM.format(editor_name=editor.display, layout=LAYOUT_PANELS),
+            f"The original request was:\n\n{request}\n\n"
+            f"The prompt that produced the RIGHT panel was:\n\n{prior_prompt}\n\n"
+            "The criteria, as edited by the person:\n"
+            + "\n".join(f"{n}. {c}" for n, c in enumerate(criteria, 1))
+            + "\n\nWrite the corrected prompt.",
+            [composite_pair(source, current)],
+            PLAN_SCHEMA,
+        )
+        return Plan(prompt=data["prompt"].strip(), reasoning=data.get("reasoning", "").strip())
 
     def release(self) -> None:
         """Unload from VRAM immediately so the editor can have the card."""
@@ -476,21 +671,43 @@ class ClaudeJudge(Judge):
         )
         return Plan(prompt=data["prompt"].strip(), reasoning=data.get("reasoning", "").strip())
 
-    def critique(self, source, candidate, request, prompt, editor):
+    def criteria(self, source, request, editor=None):
+        data = self._msg(
+            CRITERIA_SYSTEM,
+            f"The request is:\n\n{request}\n\n"
+            "This is the image it will be applied to. Write the criteria.",
+            [source],
+            CRITERIA_SCHEMA,
+        )
+        return [str(c).strip() for c in data.get("criteria", []) if str(c).strip()]
+
+    def replan(self, source, current, request, criteria, prior_prompt, editor):
+        listed = "\n".join(f"{n}. {c}" for n, c in enumerate(criteria, 1))
+        data = self._msg(
+            REPLAN_SYSTEM.format(editor_name=editor.display, layout=LAYOUT_PAIR),
+            f"The original request was:\n\n{request}\n\n"
+            f"The prompt that produced image 2 was:\n\n{prior_prompt}\n\n"
+            f"The criteria, as edited by the person:\n{listed}\n\n"
+            "Image 1 is the original. Image 2 is the current result. "
+            "Write the corrected prompt.",
+            [source, current],
+            PLAN_SCHEMA,
+        )
+        return Plan(prompt=data["prompt"].strip(), reasoning=data.get("reasoning", "").strip())
+
+    def critique(self, source, candidate, request, prompt, editor, criteria):
+        listed = "\n".join(f"{n}. {c}" for n, c in enumerate(criteria, 1))
         data = self._msg(
             CRITIQUE_SYSTEM.format(editor_name=editor.display, layout=LAYOUT_PAIR),
             f"The user asked for:\n\n{request}\n\n"
             f"The prompt used was:\n\n{prompt}\n\n"
-            "Image 1 is the original. Image 2 is the edit. Grade it.",
+            f"Acceptance criteria:\n{listed}\n\n"
+            "Image 1 is the original. Image 2 is the edit. Rule on each "
+            "criterion in order.",
             [source, candidate],
             CRITIQUE_SCHEMA,
         )
-        return Verdict(
-            satisfied=bool(data["satisfied"]),
-            score=int(data["score"]),
-            issues=[str(i) for i in data.get("issues", [])],
-            revised_prompt=str(data["revised_prompt"]).strip(),
-        )
+        return self._verdict(data)
 
 
 # --------------------------------------------------------------------------
@@ -673,7 +890,7 @@ class Settings:
     editor: str = "flux"
     flux_size: str = "9B"
     steps: int | None = None
-    max_side: int = 1024
+    max_side: int | None = None  # None = derive from the source image
     offload: str = "auto"
     judge: str = "local"
     judge_model: str = "qwen3.6:27b"
@@ -681,6 +898,13 @@ class Settings:
     num_ctx: int = 8192
     free_ollama: str = "all"
     prompt: str | None = None
+    # Criteria are the specification. Supplied here (hand-edited in the UI, or
+    # carried over from a previous run) they replace the judge's own draft.
+    criteria: list[str] | None = None
+    # Continuation: carry on from an earlier result instead of starting over.
+    prior_prompt: str | None = None  # the prompt that produced resume_from
+    resume_from: str | None = None   # image in `out` to continue from
+    start_index: int = 1             # first attempt number, so files keep counting
 
 
 def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
@@ -691,6 +915,9 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
     """
     outdir = Path(cfg.out)
     outdir.mkdir(parents=True, exist_ok=True)
+
+    if cfg.max_side is None:
+        cfg = replace(cfg, max_side=auto_max_side(source))
 
     editor = build_editor(cfg)
     judge: Judge = (
@@ -707,7 +934,20 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
         "judge": judge.name,
         "outdir": str(outdir),
         "max_iters": cfg.max_iters,
+        "max_side": cfg.max_side,
+        "source_size": list(source.size),
+        "continuing": bool(cfg.resume_from),
     }
+
+    # Criteria are the specification. Hand-edited ones arrive via cfg and are
+    # taken as given; otherwise the judge drafts them from the request before
+    # anything is generated, so it cannot quietly grade only what is easy.
+    criteria: list[str] = list(cfg.criteria) if cfg.criteria else []
+    if not criteria:
+        judge.release()
+        criteria = judge.criteria(source, cfg.request)
+        judge.release()
+    yield {"type": "criteria", "criteria": list(criteria), "edited": bool(cfg.criteria)}
 
     log: list[dict[str, Any]] = []
     best: tuple[int, Path] | None = None
@@ -717,7 +957,26 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
     needs_plan = prompt is None
 
     try:
-        for i in range(1, cfg.max_iters + 1):
+        if cfg.resume_from and cfg.prior_prompt:
+            # Carrying on from an earlier result against the edited criteria,
+            # rather than throwing away the attempts already made.
+            current = Image.open(outdir / cfg.resume_from).convert("RGB")
+            editor.release()
+            plan = judge.replan(
+                source, current, cfg.request, criteria, cfg.prior_prompt, editor
+            )
+            judge.release()
+            prompt = plan.prompt
+            needs_plan = False
+            yield {
+                "type": "replan",
+                "iteration": cfg.start_index,
+                "prompt": prompt,
+                "reasoning": plan.reasoning,
+            }
+
+        first = cfg.start_index
+        for i in range(first, first + cfg.max_iters):
             if needs_plan:
                 editor.release()
                 plan = judge.plan(source, cfg.request, editor)
@@ -751,15 +1010,33 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
             }
 
             editor.release()
-            verdict = judge.critique(source, candidate, cfg.request, prompt, editor)
+            verdict = judge.critique(
+                source, candidate, cfg.request, prompt, editor, criteria
+            )
             judge.release()
+
+            # Every unrequested change becomes a permanent criterion, so the
+            # picture cannot drift away one fix at a time, and cannot flip back
+            # and forth between two wrong versions.
+            added = [
+                c for c in verdict.new_criteria
+                if c and c.lower() not in {x.lower() for x in criteria}
+            ]
+            criteria.extend(added)
 
             yield {
                 "type": "critique",
                 "iteration": i,
                 "score": verdict.score,
                 "satisfied": verdict.satisfied,
+                "checks": [
+                    {"criterion": c.criterion, "met": c.met, "note": c.note}
+                    for c in verdict.checks
+                ],
+                "drift": verdict.drift,
                 "issues": verdict.issues,
+                "added_criteria": added,
+                "criteria": list(criteria),
             }
 
             log.append(
@@ -771,6 +1048,12 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
                     "score": verdict.score,
                     "satisfied": verdict.satisfied,
                     "issues": verdict.issues,
+                    "checks": [
+                        {"criterion": c.criterion, "met": c.met, "note": c.note}
+                        for c in verdict.checks
+                    ],
+                    "drift": verdict.drift,
+                    "added_criteria": added,
                 }
             )
             if best is None or verdict.score > best[0]:
@@ -793,6 +1076,7 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
             "iterations": len(log),
             "best_score": best[0] if best else 0,
             "final": "final.png",
+            "criteria": list(criteria),
         }
     finally:
         # Runs on GeneratorExit too, so a stopped run still leaves its images,
@@ -807,6 +1091,7 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
                         "request": cfg.request,
                         "editor": editor.repo,
                         "judge": judge.name,
+                        "criteria": criteria,
                         "iterations": log,
                     },
                     indent=2,
@@ -832,6 +1117,7 @@ def run(args) -> int:
         num_ctx=args.num_ctx,
         free_ollama=args.free_ollama,
         prompt=args.prompt,
+        criteria=args.criteria,
     )
     source = Image.open(args.image).convert("RGB")
 
@@ -842,6 +1128,18 @@ def run(args) -> int:
             print(f"editor  : {ev['editor']}  ({ev['steps']} steps)")
             print(f"judge   : {ev['judge']}")
             print(f"output  : {ev['outdir']}\n")
+        elif kind == "criteria":
+            label = "criteria (edited)" if ev["edited"] else "criteria"
+            print(f"{label}:")
+            for n, c in enumerate(ev["criteria"], 1):
+                print(f"  {n}. {c}")
+            print()
+        elif kind == "replan":
+            print(f"attempt {ev['iteration']} prompt (steered by your criteria):")
+            print(f"  {ev['prompt']}")
+            if ev["reasoning"]:
+                print(f"  why: {ev['reasoning']}")
+            print()
         elif kind == "plan":
             print(f"iteration {ev['iteration']} prompt:\n  {ev['prompt']}")
             if ev["reasoning"]:
@@ -853,8 +1151,15 @@ def run(args) -> int:
             print(f"  rendered in {ev['seconds']}s -> {ev['image']}")
         elif kind == "critique":
             print(f"  score {ev['score']}/10  satisfied={ev['satisfied']}")
-            for issue in ev["issues"]:
-                print(f"    - {issue}")
+            for c in ev["checks"]:
+                mark = "PASS" if c["met"] else "FAIL"
+                print(f"    [{mark}] {c['criterion']}")
+                if c["note"]:
+                    print(f"           {c['note']}")
+            for d in ev["drift"]:
+                print(f"    [drift] {d}")
+            for a in ev["added_criteria"]:
+                print(f"    [+criterion] {a}")
         elif kind == "revised":
             print(f"\n  revised prompt:\n  {ev['prompt']}\n")
         elif kind == "done":
@@ -887,7 +1192,13 @@ def main() -> int:
         help="9B is stronger; 4B is Apache-2.0 and leaves room for the judge",
     )
     g.add_argument("--steps", type=int, default=None, help="override sampler steps")
-    g.add_argument("--max-side", type=int, default=1024, help="longest edge of the output")
+    g.add_argument(
+        "--max-side",
+        type=lambda v: None if v.lower() == "auto" else int(v),
+        default=None,
+        help="longest edge of the output, or 'auto' (default) to derive it "
+        f"from the source, capped at {MAX_SIDE_CAP}",
+    )
     g.add_argument(
         "--offload",
         choices=["auto", "on", "off"],
@@ -915,6 +1226,14 @@ def main() -> int:
 
     p.add_argument(
         "--prompt", default=None, help="skip the first planning call and start from this prompt"
+    )
+    p.add_argument(
+        "--criterion",
+        action="append",
+        dest="criteria",
+        metavar="TEXT",
+        help="acceptance criterion the result must meet; repeat for several. "
+        "Given any, the judge uses yours instead of drafting its own.",
     )
 
     args = p.parse_args()
