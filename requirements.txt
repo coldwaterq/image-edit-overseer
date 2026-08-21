@@ -1,0 +1,12 @@
+# The editors need a diffusers build with Flux2KleinPipeline and
+# QwenImageEditPlusPipeline, which at the time of writing means git main.
+git+https://github.com/huggingface/diffusers.git
+torch>=2.10          # install the CUDA build that matches your driver
+transformers>=4.57
+accelerate>=1.12
+safetensors>=0.7
+pillow>=11
+requests>=2.32
+
+# Only needed for --judge claude
+anthropic>=0.116
