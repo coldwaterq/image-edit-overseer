@@ -344,6 +344,43 @@ def fit_to_area(size: tuple[int, int], area: int = MAX_RENDER_AREA, multiple: in
     return (w // multiple) * multiple, (h // multiple) * multiple
 
 
+#: Per-panel size in the side-by-side the judge grades. 768 was too small: a
+#: fence post in a wide driveway photo came out a few pixels across, and the
+#: judge confidently passed criteria about it that the image plainly failed.
+JUDGE_PANEL_PX = 1152
+
+
+def composite_pair(
+    before: Image.Image, after: Image.Image, max_side: int = JUDGE_PANEL_PX
+) -> Image.Image:
+    """Lay the pair out on one canvas, labelled, for judges that see one image.
+
+    Both panels are scaled to the same height and sit at the same vertical
+    offset, so anything that differs between them is a real difference rather
+    than an artefact of the layout.
+    """
+    from PIL import ImageDraw
+
+    def shrink(im: Image.Image) -> Image.Image:
+        scale = min(max_side / max(im.size), 1.0)
+        if scale >= 1.0:
+            return im.convert("RGB")
+        return im.convert("RGB").resize(
+            (int(im.width * scale), int(im.height * scale)), Image.LANCZOS
+        )
+
+    a, b = shrink(before), shrink(after)
+    h = max(a.height, b.height)
+    pad, bar = 14, 30
+    canvas = Image.new("RGB", (a.width + b.width + pad * 3, h + bar + pad * 2), (250, 250, 250))
+    draw = ImageDraw.Draw(canvas)
+    canvas.paste(a, (pad, bar + pad))
+    canvas.paste(b, (pad * 2 + a.width, bar + pad))
+    draw.text((pad + 4, 9), "LEFT PANEL = ORIGINAL", fill=(20, 20, 20))
+    draw.text((pad * 2 + a.width + 4, 9), "RIGHT PANEL = EDITED", fill=(20, 20, 20))
+    return canvas
+
+
 def fit_dimensions(img: Image.Image, max_side: int, multiple: int = 32) -> tuple[int, int]:
     """Largest size within max_side that keeps aspect and snaps to `multiple`."""
     w, h = img.size
