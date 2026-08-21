@@ -27,7 +27,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from PIL import Image
 
@@ -81,25 +81,60 @@ Rules:
 CRITIQUE_SYSTEM = """\
 You are grading an image edit for {editor_name}.
 
-You get two images. The FIRST is the original. The SECOND is the edit that was
-produced. You also get the user's request and the prompt that was used.
+{layout}
 
-Judge only whether the SECOND image satisfies the user's request while keeping
+Judge only whether the edited image satisfies the user's request while keeping
 everything the user did not ask to change.
 
-Be specific and be hard to please:
-- "satisfied" is true only if a careful person who asked for this would accept
-  it without further comment.
-- "issues" lists what is actually wrong, each one concrete and visible. If the
-  edit did not happen at all, say so. If something drifted that should not
-  have, say what.
-- "score" is 1-10 for how well the request was met.
+The editor regenerates every pixel, so a faithful edit still shifts colours a
+little everywhere. That is reconstruction noise, not a defect. Judge what a
+person would notice with the two pictures in front of them, at a glance:
+
+- IGNORE slight shifts in shade, brightness or saturation — "light beige to
+  very light beige", "gray to slightly lighter gray", mild warmth or contrast
+  changes. These are never issues and must never be listed.
+- REPORT changes a person would actually see: an object added, removed, moved
+  or reshaped; a colour changed enough to be called a different colour (green
+  hills turning grey); text altered; identity or style visibly changed.
+
+Score against what was asked, in this order:
+- 1-2: the requested change did not happen at all.
+- 3-5: it happened, but is wrong or incomplete, or something else visibly
+  drifted.
+- 6-7: the request is met and drift is minor but noticeable.
+- 8-10: the request is met and nothing else visibly changed.
+
+- "satisfied" is true at 8 or above — the request is met and a person would
+  not point at anything else and ask what happened to it. Do not withhold it
+  over shade differences; if the edit is right and nothing visibly drifted,
+  say so and stop.
+- "issues" lists only what you would actually report at those thresholds.
+  Empty is the correct answer for a good edit.
 - "revised_prompt" is a full replacement prompt that fixes the issues. Change
   the wording that failed rather than restating it louder, and keep the parts
   that worked. If satisfied is true, repeat the prompt that worked.
 
 Respond with JSON only.
 """
+
+# Ollama surfaces only one image per request, so the pair is composited into a
+# single labelled canvas. That introduces its own trap: the model starts
+# reporting the right-hand panel as "shifted right" and its hills as "moved".
+# The caveat below is load-bearing, not decoration.
+LAYOUT_PANELS = """\
+You get ONE picture containing two panels side by side. The LEFT panel is the
+original. The RIGHT panel is the edit that was produced. You also get the
+user's request and the prompt that was used.
+
+The panels are two separate images shown on one canvas. Their placement on that
+canvas means nothing: the right panel is further right, and lower or higher, only
+because of how it was pasted. Never report a subject as moved, shifted, resized
+or repositioned on that basis. Compare each panel against its own frame — a
+house centred in the left panel and centred in the right panel has NOT moved."""
+
+LAYOUT_PAIR = """\
+You get two images. The FIRST is the original. The SECOND is the edit that was
+produced. You also get the user's request and the prompt that was used."""
 
 EDITOR_STYLE = {
     "flux": (
@@ -162,12 +197,75 @@ def extract_json(text: str) -> dict[str, Any]:
     raise ValueError(f"no JSON object in model response:\n{text[:800]}")
 
 
+def composite_pair(before: Image.Image, after: Image.Image, max_side: int = 768) -> Image.Image:
+    """Lay the pair out on one canvas, labelled, for judges that see one image.
+
+    Both panels are scaled to the same height and sit at the same vertical
+    offset, so anything that differs between them is a real difference rather
+    than an artefact of the layout.
+    """
+    from PIL import ImageDraw
+
+    def shrink(im: Image.Image) -> Image.Image:
+        scale = min(max_side / max(im.size), 1.0)
+        if scale >= 1.0:
+            return im.convert("RGB")
+        return im.convert("RGB").resize(
+            (int(im.width * scale), int(im.height * scale)), Image.LANCZOS
+        )
+
+    a, b = shrink(before), shrink(after)
+    h = max(a.height, b.height)
+    pad, bar = 14, 30
+    canvas = Image.new("RGB", (a.width + b.width + pad * 3, h + bar + pad * 2), (250, 250, 250))
+    draw = ImageDraw.Draw(canvas)
+    canvas.paste(a, (pad, bar + pad))
+    canvas.paste(b, (pad * 2 + a.width, bar + pad))
+    draw.text((pad + 4, 9), "LEFT PANEL = ORIGINAL", fill=(20, 20, 20))
+    draw.text((pad * 2 + a.width + 4, 9), "RIGHT PANEL = EDITED", fill=(20, 20, 20))
+    return canvas
+
+
 def fit_dimensions(img: Image.Image, max_side: int, multiple: int = 32) -> tuple[int, int]:
     """Largest size within max_side that keeps aspect and snaps to `multiple`."""
     w, h = img.size
     scale = min(max_side / max(w, h), 1.0)
     w, h = max(int(w * scale), multiple), max(int(h * scale), multiple)
     return (w // multiple) * multiple, (h // multiple) * multiple
+
+
+def ollama_free_all() -> list[str]:
+    """Unload every model Ollama currently holds, not just ours.
+
+    A diffusion pipeline needs the whole card. Ollama cannot see the VRAM
+    diffusers is about to take, so anything left resident gets oversubscribed
+    and spills into shared system memory over PCIe -- which is roughly two
+    orders of magnitude slower than local VRAM and turns a 13s render into
+    minutes. Freeing everything first is the difference.
+    """
+    import requests
+
+    try:
+        loaded = requests.get(f"{OLLAMA_BASE}/api/ps", timeout=10).json()
+    except Exception as exc:
+        print(f"  ! could not query Ollama: {exc}", file=sys.stderr)
+        return []
+
+    freed = []
+    for entry in loaded.get("models", []):
+        name = entry.get("name") or entry.get("model")
+        if not name:
+            continue
+        try:
+            requests.post(
+                f"{OLLAMA_BASE}/api/chat",
+                json={"model": name, "messages": [], "keep_alive": 0},
+                timeout=60,
+            )
+            freed.append(name)
+        except Exception as exc:
+            print(f"  ! could not unload {name}: {exc}", file=sys.stderr)
+    return freed
 
 
 # --------------------------------------------------------------------------
@@ -256,9 +354,29 @@ class OllamaJudge(Judge):
             "keep_alive": "5m",
             "options": {"temperature": self.temperature, "num_ctx": self.num_ctx},
         }
-        resp = self._requests.post(f"{OLLAMA_BASE}/api/chat", json=payload, timeout=900)
-        resp.raise_for_status()
-        return extract_json(resp.json()["message"]["content"])
+        last: Exception | None = None
+        for attempt in range(2):
+            resp = self._requests.post(f"{OLLAMA_BASE}/api/chat", json=payload, timeout=900)
+            resp.raise_for_status()
+            message = resp.json().get("message", {})
+            # qwen3-vl reasons before answering. Normally the JSON lands in
+            # `content`, but on some turns the whole answer ends up inside
+            # `thinking` and `content` comes back empty. Do not "fix" this by
+            # sending think=False: the model reasons anyway, still returns no
+            # content, and the image stops being processed properly
+            # (prompt_eval collapses from ~4600 to ~1400 tokens).
+            for field in ("content", "thinking"):
+                text = message.get(field) or ""
+                if not text.strip():
+                    continue
+                try:
+                    return extract_json(text)
+                except ValueError as exc:
+                    last = exc
+            payload["options"] = dict(payload["options"], temperature=0.0)
+            if attempt == 0:
+                print("  ! judge returned nothing parseable, retrying at temp 0", file=sys.stderr)
+        raise last or ValueError("judge returned an empty response twice")
 
     def plan(self, source, request, editor):
         data = self._chat(
@@ -272,11 +390,11 @@ class OllamaJudge(Judge):
 
     def critique(self, source, candidate, request, prompt, editor):
         data = self._chat(
-            CRITIQUE_SYSTEM.format(editor_name=editor.display),
+            CRITIQUE_SYSTEM.format(editor_name=editor.display, layout=LAYOUT_PANELS),
             f"The user asked for:\n\n{request}\n\n"
             f"The prompt used was:\n\n{prompt}\n\n"
-            "Image 1 is the original. Image 2 is the edit. Grade it.",
-            [source, candidate],
+            "Grade the RIGHT panel against the LEFT panel.",
+            [composite_pair(source, candidate)],
             CRITIQUE_SCHEMA,
         )
         return Verdict(
@@ -360,7 +478,7 @@ class ClaudeJudge(Judge):
 
     def critique(self, source, candidate, request, prompt, editor):
         data = self._msg(
-            CRITIQUE_SYSTEM.format(editor_name=editor.display),
+            CRITIQUE_SYSTEM.format(editor_name=editor.display, layout=LAYOUT_PAIR),
             f"The user asked for:\n\n{request}\n\n"
             f"The prompt used was:\n\n{prompt}\n\n"
             "Image 1 is the original. Image 2 is the edit. Grade it.",
@@ -379,6 +497,22 @@ class ClaudeJudge(Judge):
 # editors
 # --------------------------------------------------------------------------
 
+def free_vram_gb() -> float:
+    """Free VRAM, not total.
+
+    This box runs other Ollama work, and diffusers allocations are invisible to
+    Ollama's scheduler (and vice versa). Sizing against the card's total
+    capacity assumes we own it; sizing against what is actually free lets the
+    loop coexist with whatever else is resident.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return 0.0
+    free, _total = torch.cuda.mem_get_info()
+    return free / 1e9
+
+
 class Editor:
     """A diffusion image editor that can hand its VRAM back between turns."""
 
@@ -386,13 +520,34 @@ class Editor:
     display: str
     repo: str
     default_steps: int
+    weights_gb: float  # bf16 size of every component, for the offload decision
 
-    def __init__(self, steps: int | None = None, max_side: int = 1024, offload: bool = False):
+    def __init__(self, steps: int | None = None, max_side: int = 1024, offload: str = "auto"):
         self.steps = steps or self.default_steps
         self.max_side = max_side
-        self.offload = offload
+        self.offload = self._decide_offload(offload)
         self.pipe = None
         self._on_gpu = False
+
+    def _decide_offload(self, mode: str) -> bool:
+        """Resident weights need headroom for activations, so 0.85 not 1.0.
+
+        FLUX.2 ships a language-model-sized text encoder, which pushes the 9B
+        past a 32GB card even though the transformer alone would fit. Offload
+        swaps components in one at a time, and each one fits on its own.
+        """
+        if mode != "auto":
+            return mode == "on"
+        vram = free_vram_gb()
+        if vram == 0.0:
+            return False
+        need_offload = self.weights_gb > 0.85 * vram
+        if need_offload:
+            print(
+                f"  {self.display} is ~{self.weights_gb:.0f}GB of weights and only "
+                f"{vram:.0f}GB is free -> offloading (--offload off to force resident)"
+            )
+        return need_offload
 
     @property
     def style(self) -> str:
@@ -435,8 +590,14 @@ class FluxKleinEditor(Editor):
     display = "FLUX.2 [klein]"
     default_steps = 4
 
+    # Measured on disk: 9B is 16.4GB text encoder + 18.2GB transformer + VAE.
+    # The text encoder dominates and is shared by both sizes.
+    _WEIGHTS = {"9B": 34.8, "4B": 24.0}
+
     def __init__(self, size: str = "9B", **kw):
         self.repo = f"black-forest-labs/FLUX.2-klein-{size}"
+        self.weights_gb = self._WEIGHTS[size]
+        self.display = f"FLUX.2 [klein] {size}"
         super().__init__(**kw)
 
     def _build(self):
@@ -465,6 +626,7 @@ class QwenEditor(Editor):
     display = "Qwen-Image-Edit-2511"
     repo = "Qwen/Qwen-Image-Edit-2511"
     default_steps = 40
+    weights_gb = 40.0  # 20B in bf16
 
     def _build(self):
         import torch
@@ -488,118 +650,216 @@ class QwenEditor(Editor):
         ).images[0]
 
 
-def build_editor(args) -> Editor:
-    if args.editor == "flux":
+def build_editor(cfg) -> Editor:
+    if cfg.editor == "flux":
         return FluxKleinEditor(
-            size=args.flux_size, steps=args.steps, max_side=args.max_side, offload=args.offload
+            size=cfg.flux_size, steps=cfg.steps, max_side=cfg.max_side, offload=cfg.offload
         )
-    return QwenEditor(steps=args.steps, max_side=args.max_side, offload=args.offload)
+    return QwenEditor(steps=cfg.steps, max_side=cfg.max_side, offload=cfg.offload)
 
 
 # --------------------------------------------------------------------------
 # the loop
 # --------------------------------------------------------------------------
 
-def run(args) -> int:
-    source = Image.open(args.image).convert("RGB")
-    outdir = Path(args.out)
+@dataclass
+class Settings:
+    """Everything a run needs, independent of where it was configured."""
+
+    request: str
+    out: str
+    max_iters: int = 5
+    seed: int = 1234
+    editor: str = "flux"
+    flux_size: str = "9B"
+    steps: int | None = None
+    max_side: int = 1024
+    offload: str = "auto"
+    judge: str = "local"
+    judge_model: str = "qwen3.6:27b"
+    claude_model: str = ClaudeJudge.MODEL
+    num_ctx: int = 8192
+    free_ollama: str = "all"
+    prompt: str | None = None
+
+
+def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
+    """Run the refine loop, yielding one event per step.
+
+    A generator rather than a function with prints, so the CLI and the web UI
+    drive the same loop instead of keeping two copies of it in step.
+    """
+    outdir = Path(cfg.out)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    editor = build_editor(args)
+    editor = build_editor(cfg)
     judge: Judge = (
-        ClaudeJudge(args.claude_model)
-        if args.judge == "claude"
-        else OllamaJudge(args.judge_model, num_ctx=args.num_ctx)
+        ClaudeJudge(cfg.claude_model)
+        if cfg.judge == "claude"
+        else OllamaJudge(cfg.judge_model, num_ctx=cfg.num_ctx)
     )
 
-    print(f"request : {args.request}")
-    print(f"editor  : {editor.display}  ({editor.steps} steps)")
-    print(f"judge   : {judge.name}")
-    print(f"output  : {outdir}\n")
+    yield {
+        "type": "start",
+        "request": cfg.request,
+        "editor": editor.display,
+        "steps": editor.steps,
+        "judge": judge.name,
+        "outdir": str(outdir),
+        "max_iters": cfg.max_iters,
+    }
 
     log: list[dict[str, Any]] = []
     best: tuple[int, Path] | None = None
+    satisfied_at: int | None = None
 
-    # The judge holds VRAM while it thinks, so it must let go before the
-    # pipeline loads, and vice versa. Neither fits alongside the other.
-    prompt = args.prompt
+    prompt = cfg.prompt
     needs_plan = prompt is None
-    if prompt:
-        print(f"iteration 1 prompt (yours):\n  {prompt}\n")
 
-    for i in range(1, args.max_iters + 1):
-        if needs_plan:
-            editor.release()
-            plan = judge.plan(source, args.request, editor)
-            judge.release()
-            prompt = plan.prompt
-            print(f"iteration {i} prompt:\n  {prompt}")
-            if plan.reasoning:
-                print(f"  why: {plan.reasoning}")
-            print()
-        needs_plan = False
+    try:
+        for i in range(1, cfg.max_iters + 1):
+            if needs_plan:
+                editor.release()
+                plan = judge.plan(source, cfg.request, editor)
+                judge.release()
+                prompt = plan.prompt
+                yield {
+                    "type": "plan",
+                    "iteration": i,
+                    "prompt": prompt,
+                    "reasoning": plan.reasoning,
+                }
+            needs_plan = False
 
-        editor.acquire()
-        t0 = time.time()
-        candidate = editor.edit(source, prompt, args.seed + i - 1)
-        elapsed = time.time() - t0
-        path = outdir / f"iter{i:02d}.png"
-        candidate.save(path)
-        print(f"  rendered in {elapsed:.1f}s -> {path}")
+            if cfg.free_ollama == "all":
+                freed = ollama_free_all()
+                if freed:
+                    yield {"type": "freed", "models": freed}
 
-        editor.release()
-        verdict = judge.critique(source, candidate, args.request, prompt, editor)
-        judge.release()
-
-        print(f"  score {verdict.score}/10  satisfied={verdict.satisfied}")
-        for issue in verdict.issues:
-            print(f"    - {issue}")
-
-        log.append(
-            {
+            editor.acquire()
+            t0 = time.time()
+            candidate = editor.edit(source, prompt, cfg.seed + i - 1)
+            elapsed = time.time() - t0
+            path = outdir / f"iter{i:02d}.png"
+            candidate.save(path)
+            yield {
+                "type": "render",
                 "iteration": i,
-                "prompt": prompt,
                 "image": path.name,
+                "prompt": prompt,
                 "seconds": round(elapsed, 1),
+            }
+
+            editor.release()
+            verdict = judge.critique(source, candidate, cfg.request, prompt, editor)
+            judge.release()
+
+            yield {
+                "type": "critique",
+                "iteration": i,
                 "score": verdict.score,
                 "satisfied": verdict.satisfied,
                 "issues": verdict.issues,
             }
+
+            log.append(
+                {
+                    "iteration": i,
+                    "prompt": prompt,
+                    "image": path.name,
+                    "seconds": round(elapsed, 1),
+                    "score": verdict.score,
+                    "satisfied": verdict.satisfied,
+                    "issues": verdict.issues,
+                }
+            )
+            if best is None or verdict.score > best[0]:
+                best = (verdict.score, path)
+
+            if verdict.satisfied:
+                satisfied_at = i
+                candidate.save(outdir / "final.png")
+                break
+
+            prompt = verdict.revised_prompt
+            yield {"type": "revised", "iteration": i, "prompt": prompt}
+        else:
+            if best is not None:
+                Image.open(best[1]).save(outdir / "final.png")
+
+        (outdir / "log.json").write_text(
+            json.dumps(
+                {
+                    "request": cfg.request,
+                    "editor": editor.repo,
+                    "judge": judge.name,
+                    "iterations": log,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
         )
-        if best is None or verdict.score > best[0]:
-            best = (verdict.score, path)
+        yield {
+            "type": "done",
+            "satisfied": satisfied_at is not None,
+            "iterations": len(log),
+            "best_score": best[0] if best else 0,
+            "final": "final.png",
+        }
+    finally:
+        editor.release()
 
-        if verdict.satisfied:
-            final = outdir / "final.png"
-            candidate.save(final)
-            print(f"\ndone in {i} iteration(s) -> {final}")
-            break
 
-        prompt = verdict.revised_prompt
-        print(f"\n  revised prompt:\n  {prompt}\n")
-    else:
-        score, path = best  # type: ignore[misc]
-        final = outdir / "final.png"
-        Image.open(path).save(final)
-        print(
-            f"\nstopped after {args.max_iters} iterations without a pass.\n"
-            f"best was {path.name} at {score}/10 -> {final}"
-        )
-
-    (outdir / "log.json").write_text(
-        json.dumps(
-            {
-                "request": args.request,
-                "source": str(Path(args.image).resolve()),
-                "editor": editor.repo,
-                "judge": judge.name,
-                "iterations": log,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+def run(args) -> int:
+    cfg = Settings(
+        request=args.request,
+        out=args.out,
+        max_iters=args.max_iters,
+        seed=args.seed,
+        editor=args.editor,
+        flux_size=args.flux_size,
+        steps=args.steps,
+        max_side=args.max_side,
+        offload=args.offload,
+        judge=args.judge,
+        judge_model=args.judge_model,
+        claude_model=args.claude_model,
+        num_ctx=args.num_ctx,
+        free_ollama=args.free_ollama,
+        prompt=args.prompt,
     )
-    editor.release()
+    source = Image.open(args.image).convert("RGB")
+
+    for ev in iterate(source, cfg):
+        kind = ev["type"]
+        if kind == "start":
+            print(f"request : {ev['request']}")
+            print(f"editor  : {ev['editor']}  ({ev['steps']} steps)")
+            print(f"judge   : {ev['judge']}")
+            print(f"output  : {ev['outdir']}\n")
+        elif kind == "plan":
+            print(f"iteration {ev['iteration']} prompt:\n  {ev['prompt']}")
+            if ev["reasoning"]:
+                print(f"  why: {ev['reasoning']}")
+            print()
+        elif kind == "freed":
+            print(f"  freed from VRAM: {', '.join(ev['models'])}")
+        elif kind == "render":
+            print(f"  rendered in {ev['seconds']}s -> {ev['image']}")
+        elif kind == "critique":
+            print(f"  score {ev['score']}/10  satisfied={ev['satisfied']}")
+            for issue in ev["issues"]:
+                print(f"    - {issue}")
+        elif kind == "revised":
+            print(f"\n  revised prompt:\n  {ev['prompt']}\n")
+        elif kind == "done":
+            if ev["satisfied"]:
+                print(f"\ndone in {ev['iterations']} iteration(s) -> final.png")
+            else:
+                print(
+                    f"\nstopped after {ev['iterations']} iterations without a pass.\n"
+                    f"best scored {ev['best_score']}/10 -> final.png"
+                )
     return 0
 
 
@@ -625,15 +885,28 @@ def main() -> int:
     g.add_argument("--max-side", type=int, default=1024, help="longest edge of the output")
     g.add_argument(
         "--offload",
-        action="store_true",
-        help="stream weights from RAM (slower, much lower peak VRAM)",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="stream weights from RAM. auto turns it on when the model exceeds the card",
     )
 
     j = p.add_argument_group("judge")
     j.add_argument("--judge", choices=["local", "claude"], default="local")
-    j.add_argument("--judge-model", default="qwen3-vl:32b", help="Ollama model for --judge local")
+    j.add_argument(
+        "--judge-model",
+        default="qwen3.6:27b",
+        help="Ollama vision model for --judge local. Prefer one you already keep "
+        "loaded: a second model evicts the first on a single card.",
+    )
     j.add_argument("--claude-model", default=ClaudeJudge.MODEL)
     j.add_argument("--num-ctx", type=int, default=8192)
+    j.add_argument(
+        "--free-ollama",
+        choices=["all", "own"],
+        default="all",
+        help="before each render, unload every model Ollama holds (all, the "
+        "default) or only our judge (own, polite on a shared box)",
+    )
 
     p.add_argument(
         "--prompt", default=None, help="skip the first planning call and start from this prompt"

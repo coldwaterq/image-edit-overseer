@@ -10,3 +10,8 @@ requests>=2.32
 
 # Only needed for --judge claude
 anthropic>=0.116
+
+# Only needed for the web UI (app.py)
+fastapi>=0.125
+uvicorn>=0.41
+python-multipart>=0.0.9
