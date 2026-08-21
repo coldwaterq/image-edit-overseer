@@ -83,6 +83,12 @@
     cursor: pointer; font-size: 15px;
   }
   button:disabled { opacity: .5; cursor: default; }
+  button.danger { background: transparent; color: var(--bad); border: 1px solid var(--bad); }
+  button.danger:hover { background: color-mix(in srgb, var(--bad) 10%, transparent); }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 5px; }
+  .slider { width: 100%; accent-color: var(--accent); padding: 0; }
+  #itersOut { color: var(--accent); font-variant-numeric: tabular-nums; }
+  .stopped { opacity: .75; }
 
   details.adv { margin-top: 4px; }
   details.adv summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-bottom: 10px; }
@@ -160,8 +166,14 @@
       <textarea id="request" placeholder="make the sky a stormy purple, leave the house and tree exactly as they are"></textarea>
     </div>
 
+    <div class="field">
+      <label for="max_iters">Max attempts &mdash; <span id="itersOut">5</span></label>
+      <input type="range" id="max_iters" min="1" max="12" value="5" class="slider">
+      <div class="hint">Each attempt is one render plus one critique.</div>
+    </div>
+
     <details class="adv">
-      <summary>Settings</summary>
+      <summary>More settings</summary>
       <div class="row field">
         <div>
           <label for="editor">Editor</label>
@@ -175,15 +187,9 @@
           <select id="flux_size"><option>9B</option><option>4B</option></select>
         </div>
       </div>
-      <div class="row field">
-        <div>
-          <label for="max_iters">Max tries</label>
-          <input type="number" id="max_iters" value="5" min="1" max="12">
-        </div>
-        <div>
-          <label for="max_side">Max px</label>
-          <input type="number" id="max_side" value="1024" min="256" max="2048" step="64">
-        </div>
+      <div class="field">
+        <label for="max_side">Max pixels (longest edge)</label>
+        <input type="number" id="max_side" value="1024" min="256" max="2048" step="64">
       </div>
       <div class="field">
         <label for="judge_model">Judge (Ollama)</label>
@@ -193,6 +199,7 @@
     </details>
 
     <button type="submit" id="go" disabled>Start</button>
+    <button type="button" id="stop" class="danger" hidden>Stop</button>
     <div id="status"></div>
   </form>
 
@@ -201,11 +208,13 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const drop = $('drop'), file = $('file'), feed = $('feed'), go = $('go'), status = $('status');
-let picked = null;
+const drop = $('drop'), file = $('file'), feed = $('feed'), go = $('go'),
+      stop = $('stop'), status = $('status');
+let picked = null, activeRun = null, stopping = false;
 
-function refresh() { go.disabled = !(picked && $('request').value.trim()); }
+function refresh() { go.disabled = !(picked && $('request').value.trim()) || !stop.hidden; }
 $('request').addEventListener('input', refresh);
+$('max_iters').addEventListener('input', () => { $('itersOut').textContent = $('max_iters').value; });
 
 drop.addEventListener('click', () => file.click());
 drop.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); file.click(); } });
@@ -224,6 +233,22 @@ function setFile(f) {
   r.readAsDataURL(f);
   refresh();
 }
+
+function running(on) {
+  go.hidden = on; stop.hidden = !on;
+  if (!on) { stop.disabled = false; stop.textContent = 'Stop'; stopping = false; }
+  refresh();
+}
+
+stop.addEventListener('click', async () => {
+  if (!activeRun || stopping) return;
+  stopping = true;
+  stop.disabled = true;
+  stop.textContent = 'Stopping…';
+  setStatus('Stopping after this step finishes…', true);
+  try { await fetch('/api/stop/' + activeRun, { method: 'POST' }); }
+  catch { setStatus('Could not reach the server.', false); }
+});
 
 function setStatus(text, busy) {
   status.innerHTML = text
@@ -253,7 +278,7 @@ function badgeClass(score) { return score >= 8 ? 'good' : score >= 5 ? 'warn' : 
 
 $('form').addEventListener('submit', async e => {
   e.preventDefault();
-  go.disabled = true;
+  running(true);
   feed.innerHTML = '';
   setStatus('Starting&hellip;', true);
 
@@ -268,8 +293,9 @@ $('form').addEventListener('submit', async e => {
     const res = await fetch('/api/run', { method: 'POST', body: fd });
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     runId = (await res.json()).run_id;
+    activeRun = runId;
   } catch (err) {
-    setStatus('Failed: ' + err.message, false); go.disabled = false; return;
+    setStatus('Failed: ' + err.message, false); running(false); return;
   }
 
   const src = new EventSource('/api/stream/' + runId);
@@ -320,16 +346,24 @@ $('form').addEventListener('submit', async e => {
       setStatus(d.satisfied
         ? `Accepted after ${d.iterations} attempt${d.iterations > 1 ? 's' : ''}.`
         : `Stopped after ${d.iterations} without a pass — best ${d.best_score}/10.`, false);
-      go.disabled = false;
+      running(false);
+    } else if (d.type === 'stopped') {
+      setStatus('Stopped. Attempts so far are kept below.', false);
+      document.querySelectorAll('.card .working').forEach(w => {
+        w.innerHTML = '<span>Cancelled before this attempt finished.</span>';
+        w.closest('.card').classList.add('stopped');
+      });
+      running(false);
     } else if (d.type === 'error') {
       setStatus('Error: ' + d.message, false);
-      go.disabled = false;
+      running(false);
     } else if (d.type === 'close') {
       src.close();
-      go.disabled = false;
+      activeRun = null;
+      running(false);
     }
   };
-  src.onerror = () => { setStatus('Connection lost.', false); src.close(); go.disabled = false; };
+  src.onerror = () => { setStatus('Connection lost.', false); src.close(); running(false); };
 });
 </script>
 </body>

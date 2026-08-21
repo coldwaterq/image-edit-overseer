@@ -43,14 +43,28 @@ def _worker(run_id: str, source_path: Path, cfg: Settings) -> None:
     The loop is heavy and fully synchronous (CUDA, blocking HTTP), so it gets
     its own thread and the event loop only ever touches the queue.
     """
-    q: queue.Queue = RUN_STATE[run_id]["queue"]
+    state = RUN_STATE[run_id]
+    q: queue.Queue = state["queue"]
+    cancel: threading.Event = state["cancel"]
+    gen = None
     try:
         source = Image.open(source_path).convert("RGB")
-        for event in iterate(source, cfg):
+        gen = iterate(source, cfg)
+        for event in gen:
             q.put(event)
+            if cancel.is_set():
+                # A render or a critique cannot be interrupted mid-flight, so
+                # the earliest safe exit is the next event boundary. Closing
+                # the generator runs its finally: weights released, log saved.
+                gen.close()
+                q.put({"type": "stopped"})
+                break
     except Exception as exc:  # surface failures in the UI, not just the console
         q.put({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
     finally:
+        if gen is not None:
+            gen.close()
+        state["running"] = False
         q.put(None)  # sentinel: stream complete
 
 
@@ -93,7 +107,12 @@ async def start_run(
         num_ctx=num_ctx,
     )
 
-    RUN_STATE[run_id] = {"queue": queue.Queue(), "dir": outdir}
+    RUN_STATE[run_id] = {
+        "queue": queue.Queue(),
+        "dir": outdir,
+        "cancel": threading.Event(),
+        "running": True,
+    }
     threading.Thread(
         target=_worker, args=(run_id, source_path, cfg), daemon=True
     ).start()
@@ -124,6 +143,15 @@ async def stream(run_id: str) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/stop/{run_id}")
+def stop(run_id: str) -> dict:
+    """Ask a run to stop at the next event boundary."""
+    if run_id not in RUN_STATE:
+        raise HTTPException(404, "no such run")
+    RUN_STATE[run_id]["cancel"].set()
+    return {"stopping": True, "running": RUN_STATE[run_id]["running"]}
 
 
 @app.get("/api/image/{run_id}/{name}")

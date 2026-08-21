@@ -787,18 +787,6 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
             if best is not None:
                 Image.open(best[1]).save(outdir / "final.png")
 
-        (outdir / "log.json").write_text(
-            json.dumps(
-                {
-                    "request": cfg.request,
-                    "editor": editor.repo,
-                    "judge": judge.name,
-                    "iterations": log,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
         yield {
             "type": "done",
             "satisfied": satisfied_at is not None,
@@ -807,7 +795,24 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
             "final": "final.png",
         }
     finally:
+        # Runs on GeneratorExit too, so a stopped run still leaves its images,
+        # a best-so-far final.png, and a log of what was tried.
         editor.release()
+        if log:
+            if best is not None and not (outdir / "final.png").exists():
+                Image.open(best[1]).save(outdir / "final.png")
+            (outdir / "log.json").write_text(
+                json.dumps(
+                    {
+                        "request": cfg.request,
+                        "editor": editor.repo,
+                        "judge": judge.name,
+                        "iterations": log,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
 
 
 def run(args) -> int:
