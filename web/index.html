@@ -180,6 +180,25 @@
   .mark.no { color: var(--bad); }
   .cnote { color: var(--muted); font-size: 12.5px; display: block; }
 
+  .bar {
+    flex: 1; height: 4px; background: var(--line); border-radius: 2px;
+    overflow: hidden; margin-left: 4px; min-width: 60px;
+  }
+  .bar i { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+  .think { margin-bottom: 18px; padding: 12px 15px; }
+  .think summary {
+    cursor: pointer; font-size: 12.5px; color: var(--muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: .04em;
+  }
+  .think pre {
+    margin: 10px 0 0; max-height: 210px; overflow-y: auto; white-space: pre-wrap;
+    font-size: 12px; line-height: 1.5; color: var(--muted); font-family: ui-monospace, monospace;
+  }
+  .noop {
+    background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad);
+    border-radius: 8px; padding: 9px 11px; font-size: 13px; margin-bottom: 12px;
+    font-weight: 560;
+  }
   .final { border-color: var(--accent); }
   .final .card-head { background: var(--accent-soft); }
   .working { display: flex; align-items: center; gap: 9px; padding: 15px 17px; color: var(--muted); font-size: 13.5px; }
@@ -374,6 +393,30 @@ $('addCrit').addEventListener('click', () => {
   li.querySelector('.ctext').focus();
 });
 
+let thinkPhase = null;
+
+function showThinking(phase, delta) {
+  let box = document.getElementById('think');
+  if (!box) {
+    box = document.createElement('details');
+    box.id = 'think';
+    box.className = 'panel think';
+    box.open = true;
+    box.innerHTML = '<summary><span class="dot pulse"></span> <span id="thinkPhase"></span></summary><pre id="thinkText"></pre>';
+    feed.prepend(box);
+  }
+  if (phase !== thinkPhase) {
+    thinkPhase = phase;
+    document.getElementById('thinkPhase').textContent = 'Thinking — ' + (phase || '');
+    document.getElementById('thinkText').textContent = '';
+  }
+  const t = document.getElementById('thinkText');
+  t.textContent += delta;
+  // keep it from growing without bound; the tail is the interesting part
+  if (t.textContent.length > 6000) t.textContent = t.textContent.slice(-6000);
+  t.scrollTop = t.scrollHeight;
+}
+
 function badgeClass(score) { return score >= 8 ? 'good' : score >= 5 ? 'warn' : 'bad'; }
 
 async function loadRuns(selected) {
@@ -389,7 +432,18 @@ async function loadRuns(selected) {
       o.textContent = `${mark}${what}${r.attempts ? ` — ${r.attempts} attempt${r.attempts>1?'s':''}` : ''}`;
       runPicker.appendChild(o);
     }
-    if (keep) runPicker.value = keep;
+    if (keep) {
+      runPicker.value = keep;
+    } else {
+      // Default to whatever is actually running: that is the thing you opened
+      // the page to look at. Falls back to the newest run, then to "New run".
+      const live = runs.find(r => r.running) || runs[0];
+      if (live && !activeRun) {
+        runPicker.value = live.run_id;
+        activeRun = live.run_id;
+        listen(live.run_id);
+      }
+    }
   } catch { /* listing is a convenience; ignore failures */ }
 }
 
@@ -405,12 +459,30 @@ runPicker.addEventListener('change', () => {
   listen(id);
 });
 
+let es = null;
+
 function listen(runId) {
-  const src = new EventSource('/api/stream/' + runId);
+  // EventSource reconnects by itself, and the server replays the run from the
+  // start each time, so every handler below must be safe to run twice on the
+  // same event. Keeping one connection avoids multiplying that.
+  if (es) { es.close(); es = null; }
+  const src = es = new EventSource('/api/stream/' + runId);
   src.onmessage = ev => {
     const d = JSON.parse(ev.data);
     if (d.type === 'start') {
       setStatus(`${d.editor} &middot; judged by ${d.judge}`, true);
+    } else if (d.type === 'step') {
+      const el = cardFor(d.iteration);
+      const w = el.querySelector('.working');
+      if (w) {
+        const pct = Math.round(d.done / d.total * 100);
+        w.innerHTML = `<span class="dot pulse"></span>` +
+          `<span>Generating image &mdash; step ${d.done}/${d.total}</span>` +
+          `<span class="bar"><i style="width:${pct}%"></i></span>`;
+      }
+      setStatus(`Generating &mdash; step ${d.done}/${d.total}`, true);
+    } else if (d.type === 'thinking') {
+      showThinking(d.phase, d.delta);
     } else if (d.type === 'criteria') {
       showCriteria(d.criteria, false, d.edited ? 'your requirements' : 'drafted from your request');
       setStatus('Decided what counts as done. Writing a prompt&hellip;', true);
@@ -422,6 +494,8 @@ function listen(runId) {
       const el = cardFor(d.iteration);
       el.dataset.prompt = d.prompt;
       setStatus('Wrote a prompt, generating&hellip;', true);
+    } else if (d.type === 'note') {
+      setStatus(d.message, true);
     } else if (d.type === 'freed') {
       setStatus('Freed ' + d.models.join(', ') + ' from VRAM&hellip;', true);
     } else if (d.type === 'render') {
@@ -430,8 +504,10 @@ function listen(runId) {
       el.querySelector('.badge').textContent = 'judging…';
       const prompt = el.dataset.prompt || d.prompt || '';
       el.querySelector('.working')?.remove();
-      const body = document.createElement('div');
+      const existing = el.querySelector('.card-body');
+      const body = existing || document.createElement('div');
       body.className = 'card-body';
+      const priorCrit = existing ? existing.querySelector('.crit').innerHTML : null;
       body.innerHTML = `
         <div class="shot"><img src="${d.url}" alt="attempt ${d.iteration}"></div>
         <div class="side">
@@ -440,7 +516,9 @@ function listen(runId) {
           <h4>Critique</h4>
           <div class="crit"><span class="dot pulse"></span> looking&hellip;</div>
         </div>`;
-      el.appendChild(body);
+      if (!existing) el.appendChild(body);
+      // A replayed render must not wipe a verdict we already displayed.
+      if (priorCrit && !/looking/.test(priorCrit)) el.querySelector('.crit').innerHTML = priorCrit;
       setStatus('Judging the result&hellip;', true);
     } else if (d.type === 'critique') {
       const el = cardFor(d.iteration);
@@ -448,8 +526,23 @@ function listen(runId) {
       b.textContent = d.score + '/10' + (d.satisfied ? ' &middot; accepted' : '');
       b.innerHTML = d.score + '/10' + (d.satisfied ? ' &middot; accepted' : '');
       b.className = 'badge ' + badgeClass(d.score);
-      const crit = el.querySelector('.crit');
+      let crit = el.querySelector('.crit');
+      if (!crit) {
+        el.querySelector('.working')?.remove();
+        const body = document.createElement('div');
+        body.className = 'card-body';
+        body.innerHTML = '<div class="side"><h4>Critique</h4><div class="crit"></div></div>';
+        el.appendChild(body);
+        crit = el.querySelector('.crit');
+      }
       let html = '';
+      if (d.no_op) {
+        html += '<div class="noop">The editor returned the image unchanged &mdash; ' +
+                'no criterion can pass.</div>';
+      } else if (d.differences && d.differences.length) {
+        html += '<h4>What changed</h4><ul class="issues">' +
+          d.differences.map(x => `<li>${esc(x)}</li>`).join('') + '</ul>';
+      }
       if (d.checks && d.checks.length) {
         html += '<ul class="checks">' + d.checks.map(c =>
           `<li><span class="mark ${c.met ? 'ok' : 'no'}">${c.met ? '✓' : '✗'}</span>` +
@@ -477,6 +570,8 @@ function listen(runId) {
       setStatus(d.satisfied
         ? `Accepted after ${d.iterations} attempt${d.iterations > 1 ? 's' : ''}.`
         : `Stopped after ${d.iterations} without a pass — best ${d.best_score}/10.`, false);
+      document.getElementById('think')?.remove();
+      thinkPhase = null;
       if (d.criteria) showCriteria(d.criteria, true,
         'edit these to say what you actually wanted, then try again');
       running(false);

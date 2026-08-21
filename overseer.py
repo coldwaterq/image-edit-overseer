@@ -25,7 +25,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -67,6 +67,7 @@ CRITERIA_SCHEMA = {
 CRITIQUE_SCHEMA = {
     "type": "object",
     "properties": {
+        "differences": {"type": "array", "items": {"type": "string"}},
         "checks": {
             "type": "array",
             "items": {
@@ -86,6 +87,7 @@ CRITIQUE_SCHEMA = {
         "revised_prompt": {"type": "string"},
     },
     "required": [
+        "differences",
         "checks",
         "drift",
         "new_criteria",
@@ -117,8 +119,23 @@ CRITIQUE_SYSTEM = """You are grading an image edit for {editor_name}.
 
 {layout}
 
-You are given acceptance criteria that were written BEFORE this image was
-generated. Rule on each one: does the edited image satisfy it, yes or no?
+FIRST, before you look at any criterion, say what is actually different between
+the two panels. Ignore colour, brightness, sharpness, and small shifts in
+framing or zoom -- the editor regenerates every pixel and the whole frame often
+drifts slightly. Report only structural differences: something present in one
+panel and absent in the other, or in a different place, or a different shape.
+
+If the two panels show the same scene with the same things in the same places,
+return an empty "differences" list. That is a normal and important answer: this
+editor frequently returns its input unchanged, and saying so is far more useful
+than inventing a change. An empty list is never a failure on your part.
+
+THEN rule on each criterion: does the edited image satisfy it, yes or no?
+
+A criterion asking for something to move, appear, disappear or connect CANNOT
+be met if you listed no difference involving it. Do not describe what the
+prompt asked for as though it happened -- describe what you can see. If you
+cannot make out the relevant area well enough to be sure, answer no.
 
 Answer the criterion you were given, not one you find easier to check, and
 never skip one because it is hard to see. If a criterion is about two things
@@ -153,6 +170,8 @@ Score against the criteria:
 - 6-7: every criterion met, but something visibly drifted.
 - 8-10: every criterion met and nothing else visibly changed.
 
+- "differences" lists the structural changes you can actually see, or is empty
+  if the panels show the same scene. Never list a colour or exposure shift here.
 - "checks" has one entry per criterion, in the order given: the criterion
   repeated, met true or false, and a note saying what you actually see there.
 - "drift" lists unrequested visible changes. Empty is correct for a good edit.
@@ -300,49 +319,29 @@ def extract_json(text: str) -> dict[str, Any]:
     raise ValueError(f"no JSON object in model response:\n{text[:800]}")
 
 
-# Rendering above this costs VRAM and time steeply, and the editors were not
-# trained for it. Photos come in far larger; there is no point rendering above
-# the source either, so the derived size is the smaller of the two.
-MAX_SIDE_CAP = 2048
+# FLUX.2 klein caps its reference image at one megapixel and packs it into a
+# fixed 1024 latent tokens (see pipeline_flux2_klein.py: `if image_width *
+# image_height > 1024 * 1024: _resize_to_target_area(img, 1024 * 1024)`), and
+# its docstring says 1024 gives "the best results". Asking for an output much
+# larger than that makes it generate far more latent tokens than the reference
+# supplies, and it stops editing and starts reconstructing -- silently, so you
+# get a plausible photo that simply is not edited. Measured on one photo: the
+# edit landed at 1024 and 1280 and vanished at 1536, 1792 and 2048, at every
+# step count. So the limit is area, not edge length.
+MAX_RENDER_AREA = 1024 * 1024
 
+def fit_to_area(size: tuple[int, int], area: int = MAX_RENDER_AREA, multiple: int = 32
+                ) -> tuple[int, int]:
+    """Largest size within `area` that keeps aspect, snapped to `multiple`.
 
-def auto_max_side(img: Image.Image, cap: int = MAX_SIDE_CAP) -> int:
-    """Longest edge to render at, derived from the source.
-
-    A fixed default silently downscales a phone photo by 4x before the editor
-    ever sees it, which loses exactly the fine structure the judge is asked to
-    check.
+    Never upscales: a small source stays its own size.
     """
-    return max(min(max(img.size), cap), 256)
+    import math
 
-
-def composite_pair(before: Image.Image, after: Image.Image, max_side: int = 768) -> Image.Image:
-    """Lay the pair out on one canvas, labelled, for judges that see one image.
-
-    Both panels are scaled to the same height and sit at the same vertical
-    offset, so anything that differs between them is a real difference rather
-    than an artefact of the layout.
-    """
-    from PIL import ImageDraw
-
-    def shrink(im: Image.Image) -> Image.Image:
-        scale = min(max_side / max(im.size), 1.0)
-        if scale >= 1.0:
-            return im.convert("RGB")
-        return im.convert("RGB").resize(
-            (int(im.width * scale), int(im.height * scale)), Image.LANCZOS
-        )
-
-    a, b = shrink(before), shrink(after)
-    h = max(a.height, b.height)
-    pad, bar = 14, 30
-    canvas = Image.new("RGB", (a.width + b.width + pad * 3, h + bar + pad * 2), (250, 250, 250))
-    draw = ImageDraw.Draw(canvas)
-    canvas.paste(a, (pad, bar + pad))
-    canvas.paste(b, (pad * 2 + a.width, bar + pad))
-    draw.text((pad + 4, 9), "LEFT PANEL = ORIGINAL", fill=(20, 20, 20))
-    draw.text((pad * 2 + a.width + 4, 9), "RIGHT PANEL = EDITED", fill=(20, 20, 20))
-    return canvas
+    w, h = size
+    scale = min(math.sqrt(area / (w * h)), 1.0)
+    w, h = max(int(w * scale), multiple), max(int(h * scale), multiple)
+    return (w // multiple) * multiple, (h // multiple) * multiple
 
 
 def fit_dimensions(img: Image.Image, max_side: int, multiple: int = 32) -> tuple[int, int]:
@@ -412,12 +411,15 @@ class Verdict:
     drift: list[str]
     new_criteria: list[str]
     revised_prompt: str
+    differences: list[str] = field(default_factory=list)
+    no_op: bool = False
 
     @property
     def issues(self) -> list[str]:
         """Everything wrong, for display: failed criteria first, then drift."""
+        head = ["the editor returned the image unchanged"] if self.no_op else []
         failed = [f"{c.criterion} - {c.note}" for c in self.checks if not c.met]
-        return failed + list(self.drift)
+        return head + failed + list(self.drift)
 
 
 class Judge:
@@ -457,14 +459,35 @@ class Judge:
             for c in data.get("checks", [])
         ]
         drift = [str(d) for d in data.get("drift", [])]
-        satisfied = bool(data.get("satisfied")) and all(c.met for c in checks) and not drift
+        differences = [str(d) for d in data.get("differences", []) if str(d).strip()]
+
+        # If the judge saw no structural difference at all, the editor returned
+        # its input. Nothing can satisfy an edit request in that state, whatever
+        # the model went on to claim -- and claim it does: asked to rule on
+        # criteria for an unchanged photo it produced fluent, specific,
+        # completely invented evidence for every one of them.
+        no_op = not differences
+        if no_op:
+            checks = [Check(c.criterion, False, c.note or "no change visible") for c in checks]
+
+        satisfied = (
+            bool(data.get("satisfied"))
+            and not no_op
+            and all(c.met for c in checks)
+            and not drift
+        )
+        score = int(data.get("score", 0))
+        if no_op:
+            score = min(score, 1)
         return Verdict(
             satisfied=satisfied,
-            score=int(data.get("score", 0)),
+            score=score,
             checks=checks,
             drift=drift,
             new_criteria=[str(c) for c in data.get("new_criteria", [])],
             revised_prompt=str(data.get("revised_prompt", "")).strip(),
+            differences=differences,
+            no_op=no_op,
         )
 
     def replan(
@@ -477,6 +500,10 @@ class Judge:
         editor: "Editor",
     ) -> Plan:
         raise NotImplementedError
+
+    def cpu_offloaded_gb(self) -> float:
+        """GB of this judge sitting in system RAM. Zero for hosted judges."""
+        return 0.0
 
     def release(self) -> None:
         """Give up any VRAM. No-op for hosted judges."""
@@ -498,6 +525,8 @@ class OllamaJudge(Judge):
         self.name = f"ollama:{model}"
         self.num_ctx = num_ctx
         self.temperature = temperature
+        #: set by the caller to watch the model reason; None disables streaming
+        self.on_thinking = None
         self._verify()
 
     def _verify(self) -> None:
@@ -516,28 +545,34 @@ class OllamaJudge(Judge):
                 f"Installed: {', '.join(sorted(have)) or '(none)'}"
             )
 
-    def _chat(self, system: str, user: str, images: list[Image.Image], schema: dict) -> dict:
+    def _chat(
+        self,
+        system: str,
+        user: str,
+        images: list[Image.Image],
+        schema: dict,
+        on_thinking=None,
+    ) -> dict:
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user, "images": [b64_png(i) for i in images]},
             ],
-            "stream": False,
+            "stream": bool(on_thinking or self.on_thinking),
             "format": schema,
             "keep_alive": "5m",
             "options": {"temperature": self.temperature, "num_ctx": self.num_ctx},
         }
+
         last: Exception | None = None
         for attempt in range(2):
-            resp = self._requests.post(f"{OLLAMA_BASE}/api/chat", json=payload, timeout=900)
-            resp.raise_for_status()
-            message = resp.json().get("message", {})
-            # qwen3-vl reasons before answering. Normally the JSON lands in
-            # `content`, but on some turns the whole answer ends up inside
-            # `thinking` and `content` comes back empty. Do not "fix" this by
-            # sending think=False: the model reasons anyway, still returns no
-            # content, and the image stops being processed properly
+            message = self._request(payload, on_thinking or self.on_thinking)
+            # qwen3-vl and qwen3.6 reason before answering. Normally the JSON
+            # lands in `content`, but on some turns the whole answer ends up
+            # inside `thinking` and `content` comes back empty. Do not "fix"
+            # this by sending think=False: the model reasons anyway, still
+            # returns no content, and the image stops being processed properly
             # (prompt_eval collapses from ~4600 to ~1400 tokens).
             for field in ("content", "thinking"):
                 text = message.get(field) or ""
@@ -551,6 +586,39 @@ class OllamaJudge(Judge):
             if attempt == 0:
                 print("  ! judge returned nothing parseable, retrying at temp 0", file=sys.stderr)
         raise last or ValueError("judge returned an empty response twice")
+
+    def _request(self, payload: dict, on_thinking=None) -> dict:
+        """One call to Ollama, returning the assistant message.
+
+        Streaming is only used when someone wants to watch the reasoning; the
+        deltas are forwarded as they arrive and the pieces reassembled here, so
+        the caller still gets one complete message either way.
+        """
+        resp = self._requests.post(
+            f"{OLLAMA_BASE}/api/chat", json=payload, timeout=900, stream=bool(on_thinking)
+        )
+        resp.raise_for_status()
+        if not on_thinking:
+            return resp.json().get("message", {})
+
+        parts = {"content": [], "thinking": []}
+        for raw in resp.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+            try:
+                chunk = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            msg = chunk.get("message") or {}
+            for field in ("content", "thinking"):
+                piece = msg.get(field)
+                if piece:
+                    parts[field].append(piece)
+                    if field == "thinking":
+                        on_thinking(piece)
+            if chunk.get("done"):
+                break
+        return {k: "".join(v) for k, v in parts.items()}
 
     def plan(self, source, request, editor):
         data = self._chat(
@@ -598,6 +666,25 @@ class OllamaJudge(Judge):
             PLAN_SCHEMA,
         )
         return Plan(prompt=data["prompt"].strip(), reasoning=data.get("reasoning", "").strip())
+
+    def cpu_offloaded_gb(self) -> float:
+        """How much of this model Ollama had to put in system RAM.
+
+        Ollama decides the split when the model loads and never revisits it, so
+        a judge that landed partly on CPU stays slow for its whole life. The
+        cure is to free the GPU and make it load again, but that is only worth
+        doing when it actually happened -- hence measuring rather than assuming.
+        """
+        try:
+            data = self._requests.get(f"{OLLAMA_BASE}/api/ps", timeout=10).json()
+        except Exception:
+            return 0.0
+        for entry in data.get("models", []):
+            if entry.get("name") == self.model or entry.get("model") == self.model:
+                total = entry.get("size") or 0
+                on_gpu = entry.get("size_vram") or 0
+                return max(total - on_gpu, 0) / 1e9
+        return 0.0
 
     def release(self) -> None:
         """Unload from VRAM immediately so the editor can have the card."""
@@ -739,8 +826,13 @@ class Editor:
     default_steps: int
     weights_gb: float  # bf16 size of every component, for the offload decision
 
+    #: resolution the model's default step count was chosen for
+    STEP_BASELINE_PX = 1024
+    #: distilled models fall apart past a point; do not scale past this
+    MAX_STEPS = 24
+
     def __init__(self, steps: int | None = None, max_side: int = 1024, offload: str = "auto"):
-        self.steps = steps or self.default_steps
+        self.steps = steps or self.auto_steps(max_side)
         self.max_side = max_side
         self.offload = self._decide_offload(offload)
         self.pipe = None
@@ -766,6 +858,23 @@ class Editor:
             )
         return need_offload
 
+    @classmethod
+    def auto_steps(cls, max_side: int) -> int:
+        """More denoising steps at higher resolution.
+
+        A 4-step distilled model has four passes to restructure whatever it is
+        given. At 1024 that is enough to move an object; at 2048 there is four
+        times the pixel area to rearrange in the same four passes, and the model
+        settles for reproducing its input -- structural edits silently stop
+        happening. Scaling with area keeps the work per pixel roughly constant.
+        """
+        area_ratio = (max_side / cls.STEP_BASELINE_PX) ** 2
+        return max(cls.default_steps, min(round(cls.default_steps * area_ratio), cls.MAX_STEPS))
+
+    # NOTE: raising steps does not rescue an over-large render. Resolution is a
+    # hard limit of the model; steps only control how much work it does within
+    # a size it can actually edit. Both have to be right.
+
     @property
     def style(self) -> str:
         return EDITOR_STYLE[self.key]
@@ -788,24 +897,59 @@ class Editor:
             self._on_gpu = True
         torch.cuda.synchronize()
 
-    def release(self) -> None:
-        """Park the weights in system RAM. Far cheaper than reloading from disk."""
+    def release(self, full: bool = False) -> None:
+        """Give the card back before the judge wants it.
+
+        The cheap path just drops cached blocks. `full` additionally runs the
+        offload hooks, which is what actually empties the card -- worth doing
+        only when the judge is demonstrably spilling to CPU, since Ollama sizes
+        a model against free VRAM at load time and never rebalances afterwards.
+        """
         import torch
 
-        if self.pipe is not None and not self.offload and self._on_gpu:
-            self.pipe.to("cpu")
-            self._on_gpu = False
+        if self.pipe is not None:
+            if self.offload:
+                if full:
+                    # Offload hooks leave components resident after a
+                    # generation; running them puts everything back in RAM.
+                    free_hooks = getattr(self.pipe, "maybe_free_model_hooks", None)
+                    if callable(free_hooks):
+                        free_hooks()
+            elif self._on_gpu:
+                self.pipe.to("cpu")
+                self._on_gpu = False
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    def edit(self, image: Image.Image, prompt: str, seed: int) -> Image.Image:
+    def edit(self, image: Image.Image, prompt: str, seed: int, on_step=None) -> Image.Image:
         raise NotImplementedError
+
+    def _step_cb(self, on_step):
+        """Adapt on_step(done, total) to the diffusers callback contract.
+
+        The callback must return the kwargs dict it was handed, so returning
+        the result of on_step (usually None) would break the pipeline.
+        """
+        if on_step is None:
+            return None
+        total = self.steps
+
+        def cb(pipe, i, t, kwargs):
+            on_step(i + 1, total)
+            return kwargs
+
+        return cb
 
 
 class FluxKleinEditor(Editor):
     key = "flux"
     display = "FLUX.2 [klein]"
-    default_steps = 4
+    # The model card's 4 steps is its fast text-to-image setting. For editing,
+    # 4 steps reproduces the input; 16 actually restructures the picture. Note
+    # guidance_scale is inert here -- the model is distilled, and 1.0, 2.5 and
+    # 4.0 produce byte-identical output.
+    default_steps = 16
 
     # Measured on disk: 9B is 16.4GB text encoder + 18.2GB transformer + VAE.
     # The text encoder dominates and is shared by both sizes.
@@ -823,18 +967,22 @@ class FluxKleinEditor(Editor):
 
         return Flux2KleinPipeline.from_pretrained(self.repo, torch_dtype=torch.bfloat16)
 
-    def edit(self, image, prompt, seed):
+    def edit(self, image, prompt, seed, on_step=None):
         import torch
 
-        w, h = fit_dimensions(image, self.max_side)
+        # Hand it an image already inside its one-megapixel window and let the
+        # pipeline pick height/width from that (`height = height or
+        # image_height`). Forcing a larger canvas is what made it stop editing.
+        w, h = fit_to_area((image.width, image.height), MAX_RENDER_AREA)
+        w, h = min(w, self.max_side), min(h, self.max_side)
+        w, h = fit_to_area((w, h), MAX_RENDER_AREA)
         return self.pipe(
             image=image.convert("RGB").resize((w, h), Image.LANCZOS),
             prompt=prompt,
-            height=h,
-            width=w,
-            guidance_scale=1.0,
+            guidance_scale=4.0,
             num_inference_steps=self.steps,
             generator=torch.Generator(device="cuda").manual_seed(seed),
+            callback_on_step_end=self._step_cb(on_step),
         ).images[0]
 
 
@@ -851,7 +999,7 @@ class QwenEditor(Editor):
 
         return QwenImageEditPlusPipeline.from_pretrained(self.repo, torch_dtype=torch.bfloat16)
 
-    def edit(self, image, prompt, seed):
+    def edit(self, image, prompt, seed, on_step=None):
         import torch
 
         w, h = fit_dimensions(image, self.max_side)
@@ -864,6 +1012,7 @@ class QwenEditor(Editor):
             num_inference_steps=self.steps,
             num_images_per_prompt=1,
             generator=torch.manual_seed(seed),
+            callback_on_step_end=self._step_cb(on_step),
         ).images[0]
 
 
@@ -890,7 +1039,7 @@ class Settings:
     editor: str = "flux"
     flux_size: str = "9B"
     steps: int | None = None
-    max_side: int | None = None  # None = derive from the source image
+    max_side: int | None = None  # None = fit the source into MAX_RENDER_AREA
     offload: str = "auto"
     judge: str = "local"
     judge_model: str = "qwen3.6:27b"
@@ -907,17 +1056,27 @@ class Settings:
     start_index: int = 1             # first attempt number, so files keep counting
 
 
-def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
+def iterate(source: Image.Image, cfg: Settings, on_event=None) -> "Iterator[dict[str, Any]]":
     """Run the refine loop, yielding one event per step.
 
     A generator rather than a function with prints, so the CLI and the web UI
     drive the same loop instead of keeping two copies of it in step.
     """
+    def side_event(event: dict) -> None:
+        """Progress that happens *inside* a step, so it cannot be yielded.
+
+        A generator only speaks between steps; a render takes half a minute and
+        the judge thinks for longer. These go straight to the caller's sink so
+        the page has something to show while a step is in flight.
+        """
+        if on_event is not None:
+            on_event(event)
+
     outdir = Path(cfg.out)
     outdir.mkdir(parents=True, exist_ok=True)
 
     if cfg.max_side is None:
-        cfg = replace(cfg, max_side=auto_max_side(source))
+        cfg = replace(cfg, max_side=max(fit_to_area(source.size)))
 
     editor = build_editor(cfg)
     judge: Judge = (
@@ -949,6 +1108,20 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
         judge.release()
     yield {"type": "criteria", "criteria": list(criteria), "edited": bool(cfg.criteria)}
 
+    # Once the judge is caught running partly on CPU, hand the whole card back
+    # before every later judge call. Until then the cheap release is enough,
+    # and the user's other work may be the one holding the memory anyway.
+    hand_back_fully = False
+
+    def thinking_from(phase: str):
+        """Context-manager-ish: point the judge's reasoning at the sink."""
+        judge.on_thinking = lambda d: side_event(
+            {"type": "thinking", "phase": phase, "delta": d}
+        )
+
+    def thinking_off():
+        judge.on_thinking = None
+
     log: list[dict[str, Any]] = []
     best: tuple[int, Path] | None = None
     satisfied_at: int | None = None
@@ -962,9 +1135,13 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
             # rather than throwing away the attempts already made.
             current = Image.open(outdir / cfg.resume_from).convert("RGB")
             editor.release()
-            plan = judge.replan(
-                source, current, cfg.request, criteria, cfg.prior_prompt, editor
-            )
+            thinking_from("re-planning from your requirements")
+            try:
+                plan = judge.replan(
+                    source, current, cfg.request, criteria, cfg.prior_prompt, editor
+                )
+            finally:
+                thinking_off()
             judge.release()
             prompt = plan.prompt
             needs_plan = False
@@ -978,8 +1155,12 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
         first = cfg.start_index
         for i in range(first, first + cfg.max_iters):
             if needs_plan:
-                editor.release()
-                plan = judge.plan(source, cfg.request, editor)
+                editor.release(full=hand_back_fully)
+                thinking_from(f"prompt for attempt {i}")
+                try:
+                    plan = judge.plan(source, cfg.request, editor)
+                finally:
+                    thinking_off()
                 judge.release()
                 prompt = plan.prompt
                 yield {
@@ -997,7 +1178,14 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
 
             editor.acquire()
             t0 = time.time()
-            candidate = editor.edit(source, prompt, cfg.seed + i - 1)
+            candidate = editor.edit(
+                source,
+                prompt,
+                cfg.seed + i - 1,
+                on_step=lambda done, total, it=i: side_event(
+                    {"type": "step", "iteration": it, "done": done, "total": total}
+                ),
+            )
             elapsed = time.time() - t0
             path = outdir / f"iter{i:02d}.png"
             candidate.save(path)
@@ -1009,11 +1197,22 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
                 "seconds": round(elapsed, 1),
             }
 
-            editor.release()
-            verdict = judge.critique(
-                source, candidate, cfg.request, prompt, editor, criteria
-            )
+            editor.release(full=hand_back_fully)
+            thinking_from(f"judging attempt {i}")
+            try:
+                verdict = judge.critique(
+                    source, candidate, cfg.request, prompt, editor, criteria
+                )
+            finally:
+                thinking_off()
+            spilled = judge.cpu_offloaded_gb()
             judge.release()
+            if spilled > 0.5 and not hand_back_fully:
+                hand_back_fully = True
+                yield {"type": "note", "message": (
+                    f"judge ran with {spilled:.1f}GB in system RAM; freeing the "
+                    "GPU fully before each critique from now on"
+                )}
 
             # Every unrequested change becomes a permanent criterion, so the
             # picture cannot drift away one fix at a time, and cannot flip back
@@ -1029,6 +1228,8 @@ def iterate(source: Image.Image, cfg: Settings) -> "Iterator[dict[str, Any]]":
                 "iteration": i,
                 "score": verdict.score,
                 "satisfied": verdict.satisfied,
+                "no_op": verdict.no_op,
+                "differences": verdict.differences,
                 "checks": [
                     {"criterion": c.criterion, "met": c.met, "note": c.note}
                     for c in verdict.checks
@@ -1145,12 +1346,18 @@ def run(args) -> int:
             if ev["reasoning"]:
                 print(f"  why: {ev['reasoning']}")
             print()
+        elif kind == "note":
+            print(f"  note: {ev['message']}")
         elif kind == "freed":
             print(f"  freed from VRAM: {', '.join(ev['models'])}")
         elif kind == "render":
             print(f"  rendered in {ev['seconds']}s -> {ev['image']}")
         elif kind == "critique":
             print(f"  score {ev['score']}/10  satisfied={ev['satisfied']}")
+            if ev.get("no_op"):
+                print("    !! editor returned the image unchanged")
+            for diff in ev.get("differences", []):
+                print(f"    changed: {diff}")
             for c in ev["checks"]:
                 mark = "PASS" if c["met"] else "FAIL"
                 print(f"    [{mark}] {c['criterion']}")
@@ -1197,7 +1404,7 @@ def main() -> int:
         type=lambda v: None if v.lower() == "auto" else int(v),
         default=None,
         help="longest edge of the output, or 'auto' (default) to derive it "
-        f"from the source, capped at {MAX_SIDE_CAP}",
+        "from the source so the render fits the model's one-megapixel window",
     )
     g.add_argument(
         "--offload",

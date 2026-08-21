@@ -72,10 +72,41 @@ def _worker(run_id: str, source_path: Path, cfg: Settings) -> None:
         if event.get("type") == "error":
             print(f"[{run_id}] {event['message']}", file=sys.stderr, flush=True)
 
+    # Thinking arrives as hundreds of few-character deltas. Writing each one as
+    # its own event would bloat the log and swamp the browser, so they are
+    # coalesced into at most a few updates a second.
+    pending: dict = {"phase": None, "text": [], "at": 0.0}
+
+    def flush_thinking(force: bool = False) -> None:
+        if not pending["text"]:
+            return
+        now = time.monotonic()
+        if not force and now - pending["at"] < 0.4:
+            return
+        emit({
+            "type": "thinking",
+            "phase": pending["phase"],
+            "delta": "".join(pending["text"]),
+        })
+        pending["text"] = []
+        pending["at"] = now
+
+    def side_event(event: dict) -> None:
+        if event["type"] == "thinking":
+            if event.get("phase") != pending["phase"]:
+                flush_thinking(force=True)
+                pending["phase"] = event.get("phase")
+            pending["text"].append(event.get("delta", ""))
+            flush_thinking()
+        else:
+            flush_thinking(force=True)
+            emit(event)
+
     try:
         source = Image.open(source_path).convert("RGB")
-        gen = iterate(source, cfg)
+        gen = iterate(source, cfg, on_event=side_event)
         for event in gen:
+            flush_thinking(force=True)
             if event["type"] in ("criteria", "critique") and event.get("criteria"):
                 state["criteria"] = event["criteria"]
             if event["type"] == "render":
