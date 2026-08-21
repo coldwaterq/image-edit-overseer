@@ -428,8 +428,9 @@ async function loadRuns(selected) {
       const o = document.createElement('option');
       o.value = r.run_id;
       const mark = r.running ? '● ' : (r.satisfied ? '✓ ' : '');
-      const what = r.request ? r.request.slice(0, 60) : '(no description)';
-      o.textContent = `${mark}${what}${r.attempts ? ` — ${r.attempts} attempt${r.attempts>1?'s':''}` : ''}`;
+      const what = r.request ? r.request.slice(0, 44) : '(no description)';
+      const who = r.judge ? ` · ${r.judge.replace(/^ollama:/, '')}` : '';
+      o.textContent = `${mark}${what}${who}${r.attempts ? ` · ${r.attempts} att` : ''}`;
       runPicker.appendChild(o);
     }
     if (keep) {

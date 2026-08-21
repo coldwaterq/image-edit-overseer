@@ -254,7 +254,7 @@ def list_runs(limit: int = 25) -> dict:
         events = d / "events.jsonl"
         if not events.exists():
             continue
-        request, attempts, satisfied = "", 0, False
+        request, attempts, satisfied, judge = "", 0, False, ""
         try:
             for line in events.read_text(encoding="utf-8").splitlines():
                 if not line.strip():
@@ -262,6 +262,7 @@ def list_runs(limit: int = 25) -> dict:
                 e = json.loads(line)
                 if e["type"] == "start":
                     request = e.get("request", "")
+                    judge = e.get("judge", "")
                 elif e["type"] == "render":
                     attempts = max(attempts, e.get("iteration", 0))
                 elif e["type"] == "critique" and e.get("satisfied"):
@@ -273,6 +274,7 @@ def list_runs(limit: int = 25) -> dict:
             {
                 "run_id": d.name,
                 "request": request,
+                "judge": judge,
                 "attempts": attempts,
                 "satisfied": satisfied,
                 "running": bool(state and state["running"]),

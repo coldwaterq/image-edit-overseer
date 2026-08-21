@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -854,6 +855,15 @@ def free_vram_gb() -> float:
     return free / 1e9
 
 
+#: One pipeline per (repo, offload), shared by every run in this process.
+#: Building a second one while the first is still referenced puts ~70GB of
+#: weights in a 64GB machine and the process dies in the native allocator --
+#: a segfault with no Python traceback, mid "Loading checkpoint shards".
+#: Sharing also skips the reload entirely between runs.
+_PIPELINES: dict[tuple, Any] = {}
+_PIPELINE_LOCK = threading.Lock()
+
+
 class Editor:
     """A diffusion image editor that can hand its VRAM back between turns."""
 
@@ -923,12 +933,20 @@ class Editor:
         import torch
 
         if self.pipe is None:
-            print(f"  loading {self.display} ({self.repo}) ...", flush=True)
-            t0 = time.time()
-            self.pipe = self._build()
-            if self.offload:
-                self.pipe.enable_model_cpu_offload()
-            print(f"  loaded in {time.time() - t0:.0f}s", flush=True)
+            key = (self.repo, self.offload)
+            with _PIPELINE_LOCK:
+                cached = _PIPELINES.get(key)
+                if cached is None:
+                    print(f"  loading {self.display} ({self.repo}) ...", flush=True)
+                    t0 = time.time()
+                    cached = self._build()
+                    if self.offload:
+                        cached.enable_model_cpu_offload()
+                    print(f"  loaded in {time.time() - t0:.0f}s", flush=True)
+                    _PIPELINES[key] = cached
+                else:
+                    print(f"  reusing loaded {self.display}", flush=True)
+            self.pipe = cached
         if not self.offload and not self._on_gpu:
             self.pipe.to("cuda")
             self._on_gpu = True
