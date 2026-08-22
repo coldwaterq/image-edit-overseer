@@ -1078,13 +1078,37 @@ def free_vram_gb() -> float:
     return free / 1e9
 
 
-#: One pipeline per (repo, offload), shared by every run in this process.
-#: Building a second one while the first is still referenced puts ~70GB of
-#: weights in a 64GB machine and the process dies in the native allocator --
-#: a segfault with no Python traceback, mid "Loading checkpoint shards".
-#: Sharing also skips the reload entirely between runs.
+#: Exactly one pipeline is cached at a time, keyed by (repo, offload).
+#:
+#: Sharing it across runs skips the reload and, more importantly, stops a
+#: second copy being built while the first is still referenced: ~70GB of
+#: weights in a 64GB machine kills the process in the native allocator, a
+#: segfault with no Python traceback, mid "Loading checkpoint shards".
+#:
+#: Only one, though. FLUX.2 klein is ~35GB and Qwen-Image-Edit is ~40GB, so
+#: keeping both because someone switched editors reproduces the same crash by
+#: a slower route. Switching evicts the previous one.
 _PIPELINES: dict[tuple, Any] = {}
 _PIPELINE_LOCK = threading.Lock()
+
+
+def _evict_pipelines(keep: tuple | None = None) -> None:
+    """Drop every cached pipeline except `keep`, and give back its memory."""
+    import torch
+
+    for key in [k for k in _PIPELINES if k != keep]:
+        pipe = _PIPELINES.pop(key)
+        free_hooks = getattr(pipe, "maybe_free_model_hooks", None)
+        if callable(free_hooks):
+            try:
+                free_hooks()
+            except Exception:
+                pass
+        del pipe
+        print(f"  evicted {key[0]} from the pipeline cache", flush=True)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 class Editor:
@@ -1160,6 +1184,9 @@ class Editor:
             with _PIPELINE_LOCK:
                 cached = _PIPELINES.get(key)
                 if cached is None:
+                    # Free the other editor first: two pipelines is ~75GB of
+                    # weights on a 64GB machine.
+                    _evict_pipelines()
                     print(f"  loading {self.display} ({self.repo}) ...", flush=True)
                     t0 = time.time()
                     cached = self._build()

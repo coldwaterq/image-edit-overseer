@@ -330,7 +330,7 @@ const drop = $('drop'), file = $('file'), feed = $('feed'), go = $('go'),
       stop = $('stop'), status = $('status'), critPanel = $('critPanel'),
       runPicker = $('runPicker'), teach = $('teach'),
       critList = $('critList'), critActions = $('critActions'), critSub = $('critSub');
-let picked = null, activeRun = null, stopping = false;
+let picked = null, activeRun = null, stopping = false, knownRuns = [];
 
 function refresh() { go.disabled = !(picked && $('request').value.trim()) || !stop.hidden; }
 $('request').addEventListener('input', refresh);
@@ -521,6 +521,7 @@ function badgeClass(score) { return score >= 8 ? 'good' : score >= 5 ? 'warn' : 
 async function loadRuns(selected) {
   try {
     const { runs } = await (await fetch('/api/runs')).json();
+    knownRuns = runs;
     const keep = selected || runPicker.value;
     runPicker.innerHTML = '<option value="">New run</option>';
     for (const r of runs) {
@@ -541,6 +542,7 @@ async function loadRuns(selected) {
       if (live && !activeRun) {
         runPicker.value = live.run_id;
         activeRun = live.run_id;
+        running(!!live.running);
         listen(live.run_id);
       }
     }
@@ -555,7 +557,10 @@ runPicker.addEventListener('change', () => {
   critPanel.hidden = true;
   if (!id) { activeRun = null; setStatus('', false); running(false); refresh(); return; }
   activeRun = id;
-  setStatus('Loading run…', true);
+  const live = (knownRuns.find(r => r.run_id === id) || {}).running;
+  // Attaching to a job someone else started still has to offer Stop.
+  running(!!live);
+  setStatus(live ? 'Attaching…' : 'Loading run…', !!live);
   listen(id);
 });
 
@@ -574,6 +579,7 @@ function listen(runId) {
       teach.hidden = true;
       teach.dataset.judge = d.judge || '';
     } else if (d.type === 'step') {
+      if (stop.hidden) running(true);   // replay caught up to live work
       const el = cardFor(d.iteration);
       const w = el.querySelector('.working');
       if (w) {
