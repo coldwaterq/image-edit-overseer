@@ -266,6 +266,12 @@
         </div>
       </div>
       <div class="field">
+        <label for="steps">Sampler steps</label>
+        <input type="number" id="steps" value="" min="1" max="100" placeholder="auto — per editor">
+        <div class="hint">FLUX klein is distilled for few steps; Qwen defaults to 40.</div>
+      </div>
+
+      <div class="field">
         <label for="max_side">Max pixels (longest edge)</label>
         <input type="number" id="max_side" value="" min="0" max="2048" step="64"
                placeholder="auto — from your image">
@@ -748,7 +754,7 @@ $('form').addEventListener('submit', async e => {
   const fd = new FormData();
   fd.append('image', picked);
   fd.append('request', $('request').value.trim());
-  for (const k of ['max_iters', 'editor', 'flux_size', 'judge', 'judge_model', 'max_side'])
+  for (const k of ['max_iters', 'editor', 'flux_size', 'judge', 'judge_model', 'max_side', 'steps'])
     fd.append(k, $(k).value);
 
   let runId;

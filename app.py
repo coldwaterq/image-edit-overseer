@@ -167,6 +167,7 @@ async def start_run(
     judge_model: str = Form("qwen3.6:27b"),
     judge: str = Form("local"),
     max_side: int = Form(0),
+    steps: int = Form(0),
     num_ctx: int = Form(32768),
     seed: int = Form(1234),
 ) -> dict:
@@ -189,6 +190,7 @@ async def start_run(
         judge=judge,
         judge_model=judge_model,
         max_side=max_side or None,
+        steps=steps or None,
         num_ctx=num_ctx,
         seed=seed,
     )
