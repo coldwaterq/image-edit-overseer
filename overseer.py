@@ -1321,6 +1321,30 @@ class QwenEditor(Editor):
         ).images[0]
 
 
+def _patch_txt_seq_len(transformer) -> None:
+    """Supply `max_txt_seq_len` when the quantised wrapper does not.
+
+    nunchaku 1.2.1 was built against an older diffusers. This diffusers (git
+    main, needed for Flux2KleinPipeline) requires `max_txt_seq_len` and raises
+    if neither it nor the deprecated `txt_seq_lens` arrives, which is exactly
+    what the wrapper drops. Pinning diffusers back is not an option -- the FLUX
+    editor needs main -- so the argument is filled in here from the text
+    embedding length, which is what the pipeline would have passed anyway.
+    """
+    original = transformer.forward
+
+    def forward(*args, **kwargs):
+        if "max_txt_seq_len" not in kwargs and "txt_seq_lens" not in kwargs:
+            hidden = kwargs.get("encoder_hidden_states")
+            if hidden is None and len(args) > 1:
+                hidden = args[1]
+            if hidden is not None and hasattr(hidden, "shape"):
+                kwargs["max_txt_seq_len"] = hidden.shape[1]
+        return original(*args, **kwargs)
+
+    transformer.forward = forward
+
+
 class NunchakuQwenEditor(Editor):
     """Qwen-Image-Edit with its transformer quantised to 4 bits.
 
@@ -1342,11 +1366,20 @@ class NunchakuQwenEditor(Editor):
     # 4-bit transformer (~6GB) + bf16 text encoder (~15GB) + VAE
     weights_gb = 22.0
 
-    #: low_rank 256 keeps the most quality; 128 balances; 32 is fastest
+    #: low_rank 256 keeps the most quality; 128 balances; 32 is fastest.
+    #: Measured on disk: best_quality fp4 is 14.6GB, not the ~6GB implied by
+    #: "4-bit" -- the rank-256 low-rank terms are kept at 16 bits and are large.
     VARIANTS = {"best": "best_quality", "balance": "balance", "fast": "ultimate_speed"}
+    #: transformer + 16.6GB bf16 text encoder + VAE, per variant.
+    #: balance is the default because it is the largest that stays resident:
+    #: best needs 31.5GB and lands straight back in offloading, which is the
+    #: cost this editor exists to avoid.
+    VARIANT_GB = {"best": 31.5, "balance": 26.0, "fast": 22.0}
 
-    def __init__(self, variant: str = "best", **kw):
+    def __init__(self, variant: str = "balance", **kw):
         self.variant = variant
+        self.weights_gb = self.VARIANT_GB.get(variant, 26.0)
+        self.display = f"Qwen-Image-Edit-2511 (4-bit {variant})"
         super().__init__(**kw)
 
     def _build(self):
@@ -1364,6 +1397,7 @@ class NunchakuQwenEditor(Editor):
         )
         print(f"  quantised transformer: {name} / {precision}", flush=True)
         transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(checkpoint)
+        _patch_txt_seq_len(transformer)
         return QwenImageEditPlusPipeline.from_pretrained(
             self.repo, transformer=transformer, torch_dtype=torch.bfloat16
         )
