@@ -835,6 +835,137 @@ class ClaudeJudge(Judge):
         return self._verdict(data)
 
 
+class TransformersJudge(Judge):
+    """A local judge run in-process, so a fine-tuned adapter can be used directly.
+
+    Ollama's `qwen3-vl:8b` is the *Thinking* variant: it reasons without ever
+    emitting the verdict, and three ladder cases in a row came back with no
+    parseable answer. The Instruct variant is a different model, and the point
+    of loading it here rather than through Ollama is that a LoRA adapter
+    trained on a stronger judge's answers can be attached without a GGUF
+    conversion step.
+
+    In 4-bit this is about 6GB, so unlike the 17-24GB Ollama judges it fits on
+    the card beside the diffusion transformer and never has to be swapped out.
+    """
+
+    DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
+
+    def __init__(self, model_id: str = DEFAULT_MODEL, adapter: str | None = None,
+                 four_bit: bool = True, max_new_tokens: int = 1200):
+        self.model_id = model_id
+        self.adapter = adapter
+        self.four_bit = four_bit
+        self.max_new_tokens = max_new_tokens
+        self.name = f"transformers:{model_id.split('/')[-1]}"
+        if adapter:
+            self.name += f"+{Path(adapter).name}"
+        self._model = None
+        self._proc = None
+
+    def _load(self):
+        if self._model is not None:
+            return
+        import torch
+        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+        kwargs: dict[str, Any] = {"dtype": torch.bfloat16, "device_map": "cuda:0"}
+        if self.four_bit:
+            from transformers import BitsAndBytesConfig
+
+            kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+        print(f"  loading {self.model_id} ({'4-bit' if self.four_bit else 'bf16'}) ...", flush=True)
+        t0 = time.time()
+        self._model = Qwen3VLForConditionalGeneration.from_pretrained(self.model_id, **kwargs)
+        self._proc = AutoProcessor.from_pretrained(self.model_id)
+        if self.adapter:
+            from peft import PeftModel
+
+            self._model = PeftModel.from_pretrained(self._model, self.adapter)
+            print(f"  adapter: {self.adapter}", flush=True)
+        self._model.eval()
+        print(f"  loaded in {time.time() - t0:.0f}s", flush=True)
+
+    def _generate(self, system: str, user: str, images: list[Image.Image], schema: dict) -> dict:
+        import torch
+
+        self._load()
+        # No server-side schema enforcement here, so the shape is demanded in
+        # words and parsed leniently -- extract_json already copes with fences
+        # and stray prose.
+        sys_msg = system + (
+            "\n\nReply with one JSON object matching this schema and nothing else. "
+            "No preamble, no reasoning, no code fence:\n" + json.dumps(schema)
+        )
+        content = [{"type": "image", "image": im} for im in images]
+        content.append({"type": "text", "text": user})
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": sys_msg}]},
+            {"role": "user", "content": content},
+        ]
+        inputs = self._proc.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True,
+            return_dict=True, return_tensors="pt",
+        ).to(self._model.device)
+        with torch.inference_mode():
+            out = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens,
+                                       do_sample=False)
+        text = self._proc.decode(out[0][inputs["input_ids"].shape[1]:],
+                                 skip_special_tokens=True)
+        return extract_json(text)
+
+    def criteria(self, source, request, editor=None):
+        data = self._generate(
+            CRITERIA_SYSTEM,
+            f"The request is:\n\n{request}\n\n"
+            "This is the image it will be applied to. Write the criteria.",
+            [source], CRITERIA_SCHEMA,
+        )
+        return [str(c).strip() for c in data.get("criteria", []) if str(c).strip()]
+
+    def plan(self, source, request, editor):
+        data = self._generate(
+            PLAN_SYSTEM.format(editor_name=editor.display, editor_style=editor.style),
+            f"The user wants this change:\n\n{request}\n\n"
+            "Write the prompt that produces it.",
+            [source], PLAN_SCHEMA,
+        )
+        return Plan(prompt=data["prompt"].strip(), reasoning=data.get("reasoning", "").strip())
+
+    def replan(self, source, current, request, criteria, prior_prompt, editor):
+        listed = "\n".join(f"{n}. {c}" for n, c in enumerate(criteria, 1))
+        data = self._generate(
+            REPLAN_SYSTEM.format(editor_name=editor.display, layout=LAYOUT_PANELS),
+            f"The original request was:\n\n{request}\n\n"
+            f"The prompt that produced the RIGHT panel was:\n\n{prior_prompt}\n\n"
+            f"The criteria, as edited by the person:\n{listed}\n\n"
+            "Write the corrected prompt.",
+            [composite_pair(source, current)], PLAN_SCHEMA,
+        )
+        return Plan(prompt=data["prompt"].strip(), reasoning=data.get("reasoning", "").strip())
+
+    def critique(self, source, candidate, request, prompt, editor, criteria):
+        listed = "\n".join(f"{n}. {c}" for n, c in enumerate(criteria, 1))
+        data = self._generate(
+            CRITIQUE_SYSTEM.format(editor_name=editor.display, layout=LAYOUT_PANELS),
+            f"The user asked for:\n\n{request}\n\n"
+            f"The prompt used was:\n\n{prompt}\n\n"
+            f"Acceptance criteria:\n{listed}\n\n"
+            "Grade the RIGHT panel against the LEFT panel, ruling on each "
+            "criterion in order.",
+            [composite_pair(source, candidate)], CRITIQUE_SCHEMA,
+        )
+        return self._verdict(data)
+
+    def release(self) -> None:
+        """Kept resident: in 4-bit it fits beside the editor, so it need not move."""
+
+
 # --------------------------------------------------------------------------
 # editors
 # --------------------------------------------------------------------------
@@ -1096,8 +1227,9 @@ class Settings:
     steps: int | None = None
     max_side: int | None = None  # None = fit the source into MAX_RENDER_AREA
     offload: str = "auto"
-    judge: str = "local"
+    judge: str = "local"          # local | local8b | claude
     judge_model: str = "qwen3.6:27b"
+    adapter: str | None = None    # LoRA for local8b, from distillation
     claude_model: str = ClaudeJudge.MODEL
     num_ctx: int = 8192
     free_ollama: str = "all"
@@ -1134,11 +1266,12 @@ def iterate(source: Image.Image, cfg: Settings, on_event=None) -> "Iterator[dict
         cfg = replace(cfg, max_side=max(fit_to_area(source.size)))
 
     editor = build_editor(cfg)
-    judge: Judge = (
-        ClaudeJudge(cfg.claude_model)
-        if cfg.judge == "claude"
-        else OllamaJudge(cfg.judge_model, num_ctx=cfg.num_ctx)
-    )
+    if cfg.judge == "claude":
+        judge: Judge = ClaudeJudge(cfg.claude_model)
+    elif cfg.judge == "local8b":
+        judge = TransformersJudge(adapter=cfg.adapter)
+    else:
+        judge = OllamaJudge(cfg.judge_model, num_ctx=cfg.num_ctx)
 
     yield {
         "type": "start",
@@ -1372,6 +1505,7 @@ def run(args) -> int:
         claude_model=args.claude_model,
         num_ctx=args.num_ctx,
         free_ollama=args.free_ollama,
+        adapter=args.adapter,
         prompt=args.prompt,
         criteria=args.criteria,
     )
@@ -1469,7 +1603,14 @@ def main() -> int:
     )
 
     j = p.add_argument_group("judge")
-    j.add_argument("--judge", choices=["local", "claude"], default="local")
+    j.add_argument(
+        "--judge",
+        choices=["local", "local8b", "claude"],
+        default="local",
+        help="local = an Ollama model; local8b = in-process Qwen3-VL-8B-Instruct "
+        "(trainable via distill.py); claude = Claude Opus 5",
+    )
+    j.add_argument("--adapter", default=None, help="LoRA adapter for --judge local8b")
     j.add_argument(
         "--judge-model",
         default="qwen3.6:27b",
