@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 import gc
+import inspect
 import io
 import json
 import os
@@ -1322,24 +1323,29 @@ class QwenEditor(Editor):
 
 
 def _patch_txt_seq_len(transformer) -> None:
-    """Supply `max_txt_seq_len` when the quantised wrapper does not.
+    """Supply `txt_seq_lens` when the pipeline no longer passes it.
 
-    nunchaku 1.2.1 was built against an older diffusers. This diffusers (git
-    main, needed for Flux2KleinPipeline) requires `max_txt_seq_len` and raises
-    if neither it nor the deprecated `txt_seq_lens` arrives, which is exactly
-    what the wrapper drops. Pinning diffusers back is not an option -- the FLUX
-    editor needs main -- so the argument is filled in here from the text
-    embedding length, which is what the pipeline would have passed anyway.
+    Version skew in both directions. nunchaku 1.2.1's forward takes
+    `txt_seq_lens` (the argument this diffusers calls deprecated); this
+    diffusers (git main, required by Flux2KleinPipeline) passes neither and
+    lets the inner model raise. Pinning diffusers back would break the FLUX
+    editor, so the argument is filled in here -- one length per batch item,
+    taken from the text embeddings, which is what it always was.
     """
     original = transformer.forward
+    accepted = set(inspect.signature(original).parameters)
+    name = "txt_seq_lens" if "txt_seq_lens" in accepted else "max_txt_seq_len"
 
     def forward(*args, **kwargs):
-        if "max_txt_seq_len" not in kwargs and "txt_seq_lens" not in kwargs:
+        if "txt_seq_lens" not in kwargs and "max_txt_seq_len" not in kwargs:
             hidden = kwargs.get("encoder_hidden_states")
             if hidden is None and len(args) > 1:
                 hidden = args[1]
             if hidden is not None and hasattr(hidden, "shape"):
-                kwargs["max_txt_seq_len"] = hidden.shape[1]
+                length = hidden.shape[1]
+                kwargs[name] = (
+                    [length] * hidden.shape[0] if name == "txt_seq_lens" else length
+                )
         return original(*args, **kwargs)
 
     transformer.forward = forward
@@ -1374,11 +1380,12 @@ class NunchakuQwenEditor(Editor):
     #: balance is the default because it is the largest that stays resident:
     #: best needs 31.5GB and lands straight back in offloading, which is the
     #: cost this editor exists to avoid.
-    VARIANT_GB = {"best": 31.5, "balance": 26.0, "fast": 22.0}
+    #: quantised transformer on disk + ~5GB 4-bit text encoder + 0.3GB VAE
+    VARIANT_GB = {"best": 20.0, "balance": 18.5, "fast": 14.0}
 
     def __init__(self, variant: str = "balance", **kw):
         self.variant = variant
-        self.weights_gb = self.VARIANT_GB.get(variant, 26.0)
+        self.weights_gb = self.VARIANT_GB.get(variant, 18.5)
         self.display = f"Qwen-Image-Edit-2511 (4-bit {variant})"
         super().__init__(**kw)
 
@@ -1398,8 +1405,29 @@ class NunchakuQwenEditor(Editor):
         print(f"  quantised transformer: {name} / {precision}", flush=True)
         transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(checkpoint)
         _patch_txt_seq_len(transformer)
+
+        # Quantising the transformer alone is not enough: the Qwen2.5-VL text
+        # encoder is 16.6GB in bf16, more than the 13.1GB quantised transformer
+        # beside it. In 4-bit it is ~5GB, which is the difference between the
+        # pipeline sitting on the card and spilling.
+        from transformers import BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
+
+        text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            self.repo,
+            subfolder="text_encoder",
+            dtype=torch.bfloat16,
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            ),
+        )
         return QwenImageEditPlusPipeline.from_pretrained(
-            self.repo, transformer=transformer, torch_dtype=torch.bfloat16
+            self.repo,
+            transformer=transformer,
+            text_encoder=text_encoder,
+            torch_dtype=torch.bfloat16,
         )
 
     def edit(self, image, prompt, seed, on_step=None):
