@@ -1321,12 +1321,81 @@ class QwenEditor(Editor):
         ).images[0]
 
 
+class NunchakuQwenEditor(Editor):
+    """Qwen-Image-Edit with its transformer quantised to 4 bits.
+
+    The 20B transformer in bf16 is ~40GB, which forces offloading and drags a
+    render out to minutes. SVDQuant compresses it to ~6GB with the awkward
+    components kept as 16-bit low-rank terms, so the whole pipeline sits on the
+    card and never swaps. On Blackwell the NVFP4 build is the one to use --
+    nunchaku's own get_precision() reports fp4 for a 5090.
+
+    Only the transformer is quantised; the Qwen2.5-VL text encoder and the VAE
+    still come from the base repo in bf16, which is why this needs both.
+    """
+
+    key = "qwen"
+    display = "Qwen-Image-Edit-2511 (4-bit)"
+    repo = "Qwen/Qwen-Image-Edit-2511"
+    QUANT_REPO = "QuantFunc/Nunchaku-Qwen-Image-EDIT-2511"
+    default_steps = 40
+    # 4-bit transformer (~6GB) + bf16 text encoder (~15GB) + VAE
+    weights_gb = 22.0
+
+    #: low_rank 256 keeps the most quality; 128 balances; 32 is fastest
+    VARIANTS = {"best": "best_quality", "balance": "balance", "fast": "ultimate_speed"}
+
+    def __init__(self, variant: str = "best", **kw):
+        self.variant = variant
+        super().__init__(**kw)
+
+    def _build(self):
+        import torch
+        from diffusers import QwenImageEditPlusPipeline
+        from nunchaku.models.transformers.transformer_qwenimage import (
+            NunchakuQwenImageTransformer2DModel,
+        )
+        from nunchaku.utils import get_precision
+
+        precision = get_precision()  # fp4 on Blackwell, int4 on Ada and older
+        name = self.VARIANTS.get(self.variant, "best_quality")
+        checkpoint = (
+            f"{self.QUANT_REPO}/nunchaku_qwen_image_edit_2511_{name}_{precision}.safetensors"
+        )
+        print(f"  quantised transformer: {name} / {precision}", flush=True)
+        transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(checkpoint)
+        return QwenImageEditPlusPipeline.from_pretrained(
+            self.repo, transformer=transformer, torch_dtype=torch.bfloat16
+        )
+
+    def edit(self, image, prompt, seed, on_step=None):
+        import torch
+
+        w, h = fit_to_area((image.width, image.height), MAX_RENDER_AREA)
+        w, h = min(w, self.max_side), min(h, self.max_side)
+        w, h = fit_to_area((w, h), MAX_RENDER_AREA)
+        return self.pipe(
+            image=[image.convert("RGB").resize((w, h), Image.LANCZOS)],
+            prompt=prompt,
+            negative_prompt=" ",
+            true_cfg_scale=4.0,
+            num_inference_steps=self.steps,
+            num_images_per_prompt=1,
+            generator=torch.manual_seed(seed),
+            callback_on_step_end=self._step_cb(on_step),
+        ).images[0]
+
+
 def build_editor(cfg) -> Editor:
     if cfg.editor == "flux":
         return FluxKleinEditor(
             size=cfg.flux_size, steps=cfg.steps, max_side=cfg.max_side, offload=cfg.offload
         )
-    return QwenEditor(steps=cfg.steps, max_side=cfg.max_side, offload=cfg.offload)
+    if cfg.editor == "qwen-bf16":
+        return QwenEditor(steps=cfg.steps, max_side=cfg.max_side, offload=cfg.offload)
+    return NunchakuQwenEditor(
+        steps=cfg.steps, max_side=cfg.max_side, offload=cfg.offload
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1742,7 +1811,13 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=1234)
 
     g = p.add_argument_group("editor")
-    g.add_argument("--editor", choices=["flux", "qwen"], default="flux")
+    g.add_argument(
+        "--editor",
+        choices=["flux", "qwen", "qwen-bf16"],
+        default="flux",
+        help="qwen uses the 4-bit quantised transformer (fits resident); "
+        "qwen-bf16 is the unquantised 40GB original",
+    )
     g.add_argument(
         "--flux-size",
         choices=["4B", "9B"],
