@@ -167,7 +167,12 @@
     font-size: 17px; line-height: 1; padding: 4px 6px; width: auto; border-radius: 6px;
   }
   .drop-crit:hover { color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, transparent); }
-  .crit-actions { display: flex; gap: 10px; margin-top: 12px; }
+  .crit-actions { display: flex; gap: 10px; margin-top: 12px; align-items: center; flex-wrap: wrap; }
+  .more { display: flex; gap: 6px; align-items: center; margin-left: auto; }
+  .more input {
+    width: 68px; padding: 8px 9px; border: 1px solid var(--line); border-radius: 9px;
+    background: var(--bg); color: var(--ink); font: inherit; font-size: 14px;
+  }
   .crit-actions button { width: auto; }
   button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
   button.ghost:hover { border-color: var(--accent); }
@@ -297,6 +302,10 @@
     <div class="crit-actions" id="critActions" hidden>
       <button type="button" id="addCrit" class="ghost">+ Add requirement</button>
       <button type="button" id="again">Try again with these</button>
+      <span class="more">
+        <input type="number" id="moreN" min="1" max="100" value="10" title="how many more attempts">
+        <button type="button" id="moreBtn" class="ghost">more attempts</button>
+      </span>
     </div>
   </section>
 
@@ -593,7 +602,8 @@ function listen(runId) {
       setStatus('Freed ' + d.models.join(', ') + ' from VRAM&hellip;', true);
     } else if (d.type === 'render') {
       const el = cardFor(d.iteration);
-      el.querySelector('.secs').textContent = d.seconds + 's';
+      const from = d.base && d.base !== 'source' ? ` · from ${d.base}` : '';
+      el.querySelector('.secs').textContent = d.seconds + 's' + from;
       el.querySelector('.badge').textContent = 'judging…';
       const prompt = el.dataset.prompt || d.prompt || '';
       el.querySelector('.working')?.remove();
@@ -658,15 +668,19 @@ function listen(runId) {
     } else if (d.type === 'revised') {
       const el = cardFor(d.iteration + 1);
       el.dataset.prompt = d.prompt;
-      setStatus('Rewriting the prompt&hellip;', true);
+      const base = d.next_base || 'source';
+      setStatus(base === 'source'
+        ? 'Rewriting the prompt, starting again from the original&hellip;'
+        : `Rewriting the prompt, building on ${base}&hellip;`, true);
     } else if (d.type === 'done') {
       setStatus(d.satisfied
         ? `Accepted after ${d.iterations} attempt${d.iterations > 1 ? 's' : ''}.`
         : `Stopped after ${d.iterations} without a pass — best ${d.best_score}/10.`, false);
       document.getElementById('think')?.remove();
       thinkPhase = null;
-      if (d.criteria) showCriteria(d.criteria, true,
-        'edit these to say what you actually wanted, then try again');
+      if (d.criteria) showCriteria(d.criteria, true, d.satisfied
+        ? 'accepted — edit these and try again if it is not what you wanted'
+        : 'no pass yet — give it more attempts, or edit these first');
       showTeaching(teach.dataset.judge);
       running(false);
     } else if (d.type === 'stopped') {
@@ -690,15 +704,16 @@ function listen(runId) {
   src.onerror = () => { setStatus('Connection lost.', false); src.close(); running(false); };
 }
 
-$('again').addEventListener('click', async () => {
+async function continueRun(nAttempts) {
   if (!activeRun) return;
   const list = readCriteria();
   if (!list.length) { setStatus('Keep at least one requirement.', false); return; }
   const fd = new FormData();
   fd.append('criteria', JSON.stringify(list));
-  fd.append('max_iters', $('max_iters').value);
+  fd.append('max_iters', String(nAttempts));
   running(true);
-  setStatus('Continuing from the last attempt&hellip;', true);
+  teach.hidden = true;
+  setStatus(`Continuing for ${nAttempts} more attempt${nAttempts > 1 ? 's' : ''}&hellip;`, true);
   try {
     const res = await fetch('/api/continue/' + activeRun, { method: 'POST', body: fd });
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
@@ -707,6 +722,12 @@ $('again').addEventListener('click', async () => {
     setStatus('Failed: ' + err.message, false);
     running(false);
   }
+}
+
+$('again').addEventListener('click', () => continueRun(Number($('max_iters').value)));
+$('moreBtn').addEventListener('click', () => {
+  const n = Math.min(100, Math.max(1, Number($('moreN').value) || 1));
+  continueRun(n);
 });
 
 loadRuns();

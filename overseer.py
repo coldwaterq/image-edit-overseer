@@ -83,6 +83,7 @@ CRITIQUE_SCHEMA = {
         },
         "drift": {"type": "array", "items": {"type": "string"}},
         "new_criteria": {"type": "array", "items": {"type": "string"}},
+        "next_base": {"type": "string"},
         "score": {"type": "integer"},
         "satisfied": {"type": "boolean"},
         "revised_prompt": {"type": "string"},
@@ -92,6 +93,7 @@ CRITIQUE_SCHEMA = {
         "checks",
         "drift",
         "new_criteria",
+        "next_base",
         "score",
         "satisfied",
         "revised_prompt",
@@ -180,6 +182,16 @@ Score against the criteria:
   about the finished picture. Empty when nothing drifted.
 - "satisfied" is true only when every criterion is met and nothing visibly
   drifted. An image that looks good but fails a criterion is not satisfied.
+- "next_base" chooses what the next attempt starts from: "source" for the
+  original image, or "attempt N" to keep working on the result you just graded.
+  Build on an attempt when it got something right that is worth keeping and the
+  remaining fault is a small, local change. Go back to "source" when the attempt
+  went wrong in a way that is easier to redo than to repair.
+  Weigh it: the editor regenerates every pixel, so each attempt built on the
+  last compounds the degradation -- fine detail smears and text turns to
+  nonsense after a few passes. Working from "source" costs you the progress but
+  keeps the picture clean. Prefer "source" unless building on the attempt
+  clearly saves work.
 - "revised_prompt" is a full replacement prompt that fixes what failed. Target
   the criteria that came back false, change the wording that did not work
   rather than restating it louder, and keep what did. If satisfied, repeat the
@@ -365,6 +377,18 @@ JUDGE_PANEL_PX = 1152
 CLAUDE_MAX_EDGE = 1568
 
 
+def for_judge(img: Image.Image, max_edge: int = JUDGE_PANEL_PX) -> Image.Image:
+    """Shrink a single image before any judge sees it.
+
+    composite_pair already does this for the two-panel comparison, but the
+    criteria and planning calls were handing over the untouched source. A
+    4080x3072 photo becomes an enormous number of vision tokens, and the
+    attention over them took a 8GB model to 29GB and spilled 28GB into shared
+    memory. Judges reason about layout, not pixel detail.
+    """
+    return for_api(img, max_edge)
+
+
 def for_api(img: Image.Image, max_edge: int = CLAUDE_MAX_EDGE) -> Image.Image:
     """Shrink to what a hosted vision API will actually look at."""
     scale = min(max_edge / max(img.size), 1.0)
@@ -473,6 +497,7 @@ class Verdict:
     drift: list[str]
     new_criteria: list[str]
     revised_prompt: str
+    next_base: str = "source"
     differences: list[str] = field(default_factory=list)
     no_op: bool = False
 
@@ -548,6 +573,7 @@ class Judge:
             drift=drift,
             new_criteria=[str(c) for c in data.get("new_criteria", [])],
             revised_prompt=str(data.get("revised_prompt", "")).strip(),
+            next_base=str(data.get("next_base", "source")).strip() or "source",
             differences=differences,
             no_op=no_op,
         )
@@ -687,7 +713,7 @@ class OllamaJudge(Judge):
             PLAN_SYSTEM.format(editor_name=editor.display, editor_style=editor.style),
             f"The user wants this change:\n\n{request}\n\n"
             "Write the prompt that produces it.",
-            [source],
+            [for_judge(source)],
             PLAN_SCHEMA,
         )
         return Plan(prompt=data["prompt"].strip(), reasoning=data.get("reasoning", "").strip())
@@ -711,7 +737,7 @@ class OllamaJudge(Judge):
             CRITERIA_SYSTEM,
             f"The request is:\n\n{request}\n\n"
             "This is the image it will be applied to. Write the criteria.",
-            [source],
+            [for_judge(source)],
             CRITERIA_SCHEMA,
         )
         return [str(c).strip() for c in data.get("criteria", []) if str(c).strip()]
@@ -829,7 +855,7 @@ class ClaudeJudge(Judge):
             CRITERIA_SYSTEM,
             f"The request is:\n\n{request}\n\n"
             "This is the image it will be applied to. Write the criteria.",
-            [source],
+            [for_judge(source)],
             CRITERIA_SCHEMA,
         )
         return [str(c).strip() for c in data.get("criteria", []) if str(c).strip()]
@@ -843,7 +869,7 @@ class ClaudeJudge(Judge):
             f"The criteria, as edited by the person:\n{listed}\n\n"
             "Image 1 is the original. Image 2 is the current result. "
             "Write the corrected prompt.",
-            [source, current],
+            [for_judge(source), for_judge(current)],
             PLAN_SCHEMA,
         )
         return Plan(prompt=data["prompt"].strip(), reasoning=data.get("reasoning", "").strip())
@@ -857,7 +883,7 @@ class ClaudeJudge(Judge):
             f"Acceptance criteria:\n{listed}\n\n"
             "Image 1 is the original. Image 2 is the edit. Rule on each "
             "criterion in order.",
-            [source, candidate],
+            [for_judge(source), for_judge(candidate)],
             CRITIQUE_SCHEMA,
         )
         return self._verdict(data)
@@ -910,7 +936,12 @@ class TransformersJudge(Judge):
         print(f"  loading {self.model_id} ({'4-bit' if self.four_bit else 'bf16'}) ...", flush=True)
         t0 = time.time()
         self._model = Qwen3VLForConditionalGeneration.from_pretrained(self.model_id, **kwargs)
-        self._proc = AutoProcessor.from_pretrained(self.model_id)
+        # Hard cap on vision tokens. Even if a caller forgets to downscale,
+        # the processor will not turn a 12-megapixel photo into tens of
+        # thousands of tokens.
+        self._proc = AutoProcessor.from_pretrained(
+            self.model_id, max_pixels=JUDGE_PANEL_PX * JUDGE_PANEL_PX
+        )
         if self.adapter:
             from peft import PeftModel
 
@@ -952,7 +983,7 @@ class TransformersJudge(Judge):
             CRITERIA_SYSTEM,
             f"The request is:\n\n{request}\n\n"
             "This is the image it will be applied to. Write the criteria.",
-            [source], CRITERIA_SCHEMA,
+            [for_judge(source)], CRITERIA_SCHEMA,
         )
         return [str(c).strip() for c in data.get("criteria", []) if str(c).strip()]
 
@@ -961,7 +992,7 @@ class TransformersJudge(Judge):
             PLAN_SYSTEM.format(editor_name=editor.display, editor_style=editor.style),
             f"The user wants this change:\n\n{request}\n\n"
             "Write the prompt that produces it.",
-            [source], PLAN_SCHEMA,
+            [for_judge(source)], PLAN_SCHEMA,
         )
         return Plan(prompt=data["prompt"].strip(), reasoning=data.get("reasoning", "").strip())
 
@@ -1016,6 +1047,20 @@ class TransformersJudge(Judge):
 # --------------------------------------------------------------------------
 # editors
 # --------------------------------------------------------------------------
+
+def vram_note(tag: str) -> str:
+    """One line of ground truth about the card, for tracing who holds what."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return f"{tag}: no cuda"
+    free, total = torch.cuda.mem_get_info()
+    used = (total - free) / 1e9
+    reserved = torch.cuda.memory_reserved() / 1e9
+    allocated = torch.cuda.memory_allocated() / 1e9
+    return (f"{tag}: card {used:.1f}/{total/1e9:.1f}GB used, "
+            f"this process reserved {reserved:.1f}GB (allocated {allocated:.1f}GB)")
+
 
 def free_vram_gb() -> float:
     """Free VRAM, not total.
@@ -1290,6 +1335,25 @@ class Settings:
     start_index: int = 1             # first attempt number, so files keep counting
 
 
+def _resolve_base(choice: str, source: Image.Image,
+                  attempts: dict[int, Image.Image]) -> tuple[Image.Image, str]:
+    """Turn the judge's choice of starting image into an actual image.
+
+    Falls back to the source for anything unrecognised: an attempt that does
+    not exist, or a model that invented a label. Starting over is always safe;
+    building on the wrong picture is not.
+    """
+    text = (choice or "source").lower()
+    if "source" in text or "original" in text:
+        return source, "source"
+    match = re.search(r"(\d+)", text)
+    if match:
+        n = int(match.group(1))
+        if n in attempts:
+            return attempts[n], f"attempt {n}"
+    return source, "source"
+
+
 def iterate(source: Image.Image, cfg: Settings, on_event=None) -> "Iterator[dict[str, Any]]":
     """Run the refine loop, yielding one event per step.
 
@@ -1320,6 +1384,7 @@ def iterate(source: Image.Image, cfg: Settings, on_event=None) -> "Iterator[dict
     else:
         judge = OllamaJudge(cfg.judge_model, num_ctx=cfg.num_ctx)
 
+    side_event({"type": "note", "message": vram_note("start")})
     yield {
         "type": "start",
         "request": cfg.request,
@@ -1341,6 +1406,7 @@ def iterate(source: Image.Image, cfg: Settings, on_event=None) -> "Iterator[dict
         judge.release()
         criteria = judge.criteria(source, cfg.request)
         judge.release()
+    side_event({"type": "note", "message": vram_note("after criteria")})
     yield {"type": "criteria", "criteria": list(criteria), "edited": bool(cfg.criteria)}
 
     # Once the judge is caught running partly on CPU, hand the whole card back
@@ -1359,6 +1425,10 @@ def iterate(source: Image.Image, cfg: Settings, on_event=None) -> "Iterator[dict
 
     log: list[dict[str, Any]] = []
     best: tuple[int, Path] | None = None
+    # every attempt kept, so the judge can pick one to build on
+    attempts: dict[int, Image.Image] = {}
+    base = source          # what the next render starts from
+    base_label = "source"
     satisfied_at: int | None = None
 
     prompt = cfg.prompt
@@ -1411,10 +1481,12 @@ def iterate(source: Image.Image, cfg: Settings, on_event=None) -> "Iterator[dict
                 if freed:
                     yield {"type": "freed", "models": freed}
 
+            side_event({"type": "note", "message": vram_note("before acquire")})
             editor.acquire()
+            side_event({"type": "note", "message": vram_note("after acquire")})
             t0 = time.time()
             candidate = editor.edit(
-                source,
+                base,
                 prompt,
                 cfg.seed + i - 1,
                 on_step=lambda done, total, it=i: side_event(
@@ -1424,12 +1496,14 @@ def iterate(source: Image.Image, cfg: Settings, on_event=None) -> "Iterator[dict
             elapsed = time.time() - t0
             path = outdir / f"iter{i:02d}.png"
             candidate.save(path)
+            attempts[i] = candidate
             yield {
                 "type": "render",
                 "iteration": i,
                 "image": path.name,
                 "prompt": prompt,
                 "seconds": round(elapsed, 1),
+                "base": base_label,
             }
 
             editor.release(full=hand_back_fully)
@@ -1501,7 +1575,13 @@ def iterate(source: Image.Image, cfg: Settings, on_event=None) -> "Iterator[dict
                 break
 
             prompt = verdict.revised_prompt
-            yield {"type": "revised", "iteration": i, "prompt": prompt}
+            base, base_label = _resolve_base(verdict.next_base, source, attempts)
+            yield {
+                "type": "revised",
+                "iteration": i,
+                "prompt": prompt,
+                "next_base": base_label,
+            }
         else:
             if best is not None:
                 Image.open(best[1]).save(outdir / "final.png")
@@ -1593,7 +1673,8 @@ def run(args) -> int:
         elif kind == "freed":
             print(f"  freed from VRAM: {', '.join(ev['models'])}")
         elif kind == "render":
-            print(f"  rendered in {ev['seconds']}s -> {ev['image']}")
+            frm = ev.get("base", "source")
+            print(f"  rendered in {ev['seconds']}s from {frm} -> {ev['image']}")
         elif kind == "critique":
             print(f"  score {ev['score']}/10  satisfied={ev['satisfied']}")
             if ev.get("no_op"):
@@ -1610,7 +1691,8 @@ def run(args) -> int:
             for a in ev["added_criteria"]:
                 print(f"    [+criterion] {a}")
         elif kind == "revised":
-            print(f"\n  revised prompt:\n  {ev['prompt']}\n")
+            print(f"\n  next attempt builds on {ev.get('next_base', 'source')}")
+            print(f"  revised prompt:\n  {ev['prompt']}\n")
         elif kind == "done":
             if ev["satisfied"]:
                 print(f"\ndone in {ev['iterations']} iteration(s) -> final.png")
