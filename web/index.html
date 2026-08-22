@@ -194,6 +194,13 @@
     margin: 10px 0 0; max-height: 210px; overflow-y: auto; white-space: pre-wrap;
     font-size: 12px; line-height: 1.5; color: var(--muted); font-family: ui-monospace, monospace;
   }
+  .teach { margin-bottom: 20px; }
+  #trainLog {
+    margin: 12px 0 0; max-height: 190px; overflow-y: auto; white-space: pre-wrap;
+    font-size: 12px; line-height: 1.5; color: var(--muted);
+    font-family: ui-monospace, monospace; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  }
   .noop {
     background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad);
     border-radius: 8px; padding: 9px 11px; font-size: 13px; margin-bottom: 12px;
@@ -259,7 +266,17 @@
         <div class="hint">Blank derives it from the source, capped at 2048.</div>
       </div>
       <div class="field">
-        <label for="judge_model">Judge (Ollama)</label>
+        <label for="judge">Judge</label>
+        <select id="judge">
+          <option value="local">Ollama model (below)</option>
+          <option value="local8b">Qwen3-VL-8B local — trainable</option>
+          <option value="claude">Claude Opus 5 — teacher</option>
+        </select>
+        <div class="hint">The 8B is fast but agrees with everything until trained.</div>
+      </div>
+
+      <div class="field">
+        <label for="judge_model">Ollama model (when judge = Ollama)</label>
         <input type="text" id="judge_model" value="qwen3.6:27b"
                style="width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--ink);font:inherit;font-size:14px">
       </div>
@@ -282,6 +299,18 @@
       <button type="button" id="again">Try again with these</button>
     </div>
   </section>
+
+  <section class="panel teach" id="teach" hidden>
+    <div class="crit-head">
+      <h3>Teaching the small judge</h3>
+      <span class="crit-sub" id="teachSub"></span>
+    </div>
+    <div class="crit-actions">
+      <button type="button" id="retryClaude" class="ghost" hidden>Retry with Claude</button>
+      <button type="button" id="trainBtn" hidden>Train this as the solution</button>
+    </div>
+    <pre id="trainLog" hidden></pre>
+  </section>
   <main id="feed"><div class="panel empty">Nothing yet &mdash; add an image and describe the edit.</div></main>
 </div>
 </div>
@@ -290,7 +319,7 @@
 const $ = id => document.getElementById(id);
 const drop = $('drop'), file = $('file'), feed = $('feed'), go = $('go'),
       stop = $('stop'), status = $('status'), critPanel = $('critPanel'),
-      runPicker = $('runPicker'),
+      runPicker = $('runPicker'), teach = $('teach'),
       critList = $('critList'), critActions = $('critActions'), critSub = $('critSub');
 let picked = null, activeRun = null, stopping = false;
 
@@ -417,6 +446,67 @@ function showThinking(phase, delta) {
   t.scrollTop = t.scrollHeight;
 }
 
+async function refreshDataset() {
+  try {
+    const d = await (await fetch('/api/dataset')).json();
+    const by = Object.entries(d.teachers || {}).map(([k, v]) => `${k.replace(/^\w+:/, '')} ${v}`).join(', ');
+    $('teachSub').textContent = d.examples
+      ? `${d.examples} example${d.examples === 1 ? '' : 's'} captured${by ? ' — ' + by : ''}`
+      : 'nothing captured yet';
+    if (d.training) {
+      $('trainLog').hidden = false;
+      $('trainLog').textContent = (d.log || []).join('\n');
+      $('trainLog').scrollTop = $('trainLog').scrollHeight;
+      $('trainBtn').disabled = true;
+      setTimeout(refreshDataset, 3000);
+    } else {
+      $('trainBtn').disabled = false;
+      if (d.log && d.log.length) {
+        $('trainLog').hidden = false;
+        $('trainLog').textContent = d.log.join('\n');
+      }
+    }
+  } catch { /* stats are a convenience */ }
+}
+
+function showTeaching(judgeName) {
+  teach.hidden = false;
+  const isClaude = /claude/i.test(judgeName || '');
+  // Escalate when a local judge signed off; teach when Claude did.
+  $('retryClaude').hidden = isClaude;
+  $('trainBtn').hidden = !isClaude;
+  refreshDataset();
+}
+
+$('retryClaude').addEventListener('click', async () => {
+  if (!activeRun) return;
+  setStatus('Re-running with Claude…', true);
+  const fd = new FormData(); fd.append('judge', 'claude');
+  try {
+    const res = await fetch('/api/retry/' + activeRun, { method: 'POST', body: fd });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const { run_id } = await res.json();
+    activeRun = run_id;
+    feed.innerHTML = ''; teach.hidden = true; critPanel.hidden = true;
+    running(true); loadRuns(run_id); listen(run_id);
+  } catch (err) { setStatus('Failed: ' + err.message, false); }
+});
+
+$('trainBtn').addEventListener('click', async () => {
+  if (!activeRun) return;
+  $('trainBtn').disabled = true;
+  $('trainLog').hidden = false;
+  $('trainLog').textContent = 'capturing…';
+  try {
+    const res = await fetch('/api/train/' + activeRun, { method: 'POST' });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    refreshDataset();
+  } catch (err) {
+    $('trainLog').textContent = 'Failed: ' + err.message;
+    $('trainBtn').disabled = false;
+  }
+});
+
 function badgeClass(score) { return score >= 8 ? 'good' : score >= 5 ? 'warn' : 'bad'; }
 
 async function loadRuns(selected) {
@@ -472,6 +562,8 @@ function listen(runId) {
     const d = JSON.parse(ev.data);
     if (d.type === 'start') {
       setStatus(`${d.editor} &middot; judged by ${d.judge}`, true);
+      teach.hidden = true;
+      teach.dataset.judge = d.judge || '';
     } else if (d.type === 'step') {
       const el = cardFor(d.iteration);
       const w = el.querySelector('.working');
@@ -575,6 +667,7 @@ function listen(runId) {
       thinkPhase = null;
       if (d.criteria) showCriteria(d.criteria, true,
         'edit these to say what you actually wanted, then try again');
+      showTeaching(teach.dataset.judge);
       running(false);
     } else if (d.type === 'stopped') {
       setStatus('Stopped. Edit the requirements and try again when ready.', false);
@@ -627,7 +720,7 @@ $('form').addEventListener('submit', async e => {
   const fd = new FormData();
   fd.append('image', picked);
   fd.append('request', $('request').value.trim());
-  for (const k of ['max_iters', 'editor', 'flux_size', 'judge_model', 'max_side'])
+  for (const k of ['max_iters', 'editor', 'flux_size', 'judge', 'judge_model', 'max_side'])
     fd.append(k, $(k).value);
 
   let runId;

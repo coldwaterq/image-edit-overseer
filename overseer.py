@@ -287,6 +287,14 @@ def b64_png(img: Image.Image) -> str:
     return base64.standard_b64encode(buf.getvalue()).decode("ascii")
 
 
+def b64_jpeg(img: Image.Image, quality: int = 90) -> str:
+    """JPEG rather than PNG: a photograph is an order of magnitude smaller,
+    and these go to an API that caps an image at 10MB of base64."""
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=True)
+    return base64.standard_b64encode(buf.getvalue()).decode("ascii")
+
+
 def extract_json(text: str) -> dict[str, Any]:
     """Parse a JSON object out of a model response.
 
@@ -349,6 +357,22 @@ def fit_to_area(size: tuple[int, int], area: int = MAX_RENDER_AREA, multiple: in
 #: fence post in a wide driveway photo came out a few pixels across, and the
 #: judge confidently passed criteria about it that the image plainly failed.
 JUDGE_PANEL_PX = 1152
+
+
+#: Anthropic scales anything above this down before the model sees it, and
+#: caps an image at 10MB of base64. A 4080x3072 PNG is 31MB, so sending the
+#: original is both rejected and pointless.
+CLAUDE_MAX_EDGE = 1568
+
+
+def for_api(img: Image.Image, max_edge: int = CLAUDE_MAX_EDGE) -> Image.Image:
+    """Shrink to what a hosted vision API will actually look at."""
+    scale = min(max_edge / max(img.size), 1.0)
+    if scale >= 1.0:
+        return img.convert("RGB")
+    return img.convert("RGB").resize(
+        (max(int(img.width * scale), 1), max(int(img.height * scale), 1)), Image.LANCZOS
+    )
 
 
 def composite_pair(
@@ -755,7 +779,11 @@ class ClaudeJudge(Judge):
             content.append(
                 {
                     "type": "image",
-                    "source": {"type": "base64", "media_type": "image/png", "data": b64_png(img)},
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": b64_jpeg(for_api(img)),
+                    },
                 }
             )
         content.append({"type": "text", "text": user})
@@ -963,7 +991,26 @@ class TransformersJudge(Judge):
         return self._verdict(data)
 
     def release(self) -> None:
-        """Kept resident: in 4-bit it fits beside the editor, so it need not move."""
+        """Drop the model so the editor gets the whole card.
+
+        It was tempting to keep this resident -- 4-bit is only ~6GB, which
+        looks like it fits beside an 18.2GB transformer. It does not. Under
+        offloading a render cycles BOTH the 16.4GB text encoder and the
+        transformer through the card, so peak demand is far above the resident
+        figure, and holding 6GB back pushed 23GB into shared memory.
+
+        Reloading costs ~26s, which is still less than the ~60s swap the
+        17-24GB Ollama judges pay.
+        """
+        import torch
+
+        if self._model is None:
+            return
+        self._model = None
+        self._proc = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # --------------------------------------------------------------------------
@@ -1470,7 +1517,13 @@ def iterate(source: Image.Image, cfg: Settings, on_event=None) -> "Iterator[dict
     finally:
         # Runs on GeneratorExit too, so a stopped run still leaves its images,
         # a best-so-far final.png, and a log of what was tried.
-        editor.release()
+        #
+        # full=True is not optional here. The pipeline is cached and outlives
+        # the run, so anything its offload hooks left on the card stays there
+        # and the next run piles on top: two runs in and the card was 31GB
+        # dedicated with 28GB spilled to shared memory. Ending a run has to
+        # hand the card back completely.
+        editor.release(full=True)
         if log:
             if best is not None and not (outdir / "final.png").exists():
                 Image.open(best[1]).save(outdir / "final.png")

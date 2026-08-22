@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -20,6 +21,7 @@ import traceback
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
@@ -36,6 +38,23 @@ app = FastAPI(title="image-edit-overseer")
 
 # run_id -> {"dir": Path, "cancel": Event, "running": bool, "cfg": Settings, ...}
 RUN_STATE: dict[str, dict] = {}
+
+#: one training job at a time; the GPU cannot host two
+TRAINING: dict[str, Any] = {"running": False, "log": []}
+
+
+def _read_events(outdir: Path) -> list[dict]:
+    path = outdir / "events.jsonl"
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
 
 
 def _run_dir(run_id: str) -> Path:
@@ -181,6 +200,8 @@ async def start_run(
         "cfg": cfg,
         "source": source_path,
         "criteria": [],
+        "request": request.strip(),
+        "judge": judge,
         "last_image": None,
         "last_prompt": None,
         "last_iter": 0,
@@ -322,6 +343,111 @@ async def continue_run(
         target=_worker, args=(run_id, state["source"], cfg), daemon=True
     ).start()
     return {"run_id": run_id, "from_attempt": state["last_iter"], "criteria": edited}
+
+
+@app.post("/api/retry/{run_id}")
+async def retry_with(run_id: str, judge: str = Form("claude")) -> dict:
+    """Re-run the same edit with a different judge.
+
+    The point is the escalation path: when the small judge waves something
+    through, running the identical request past Claude produces both a better
+    answer and a labelled example of the call the small one got wrong.
+    """
+    outdir = _run_dir(run_id)
+    events = _read_events(outdir)
+    start = next((e for e in events if e["type"] == "start"), None)
+    if start is None:
+        raise HTTPException(400, "that run never started")
+    source = outdir / "source.png"
+    if not source.exists():
+        raise HTTPException(400, "no source image for that run")
+
+    prev = RUN_STATE.get(run_id, {}).get("cfg")
+    new_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    new_dir = RUNS / new_id
+    new_dir.mkdir(parents=True, exist_ok=True)
+    Image.open(source).convert("RGB").save(new_dir / "source.png")
+
+    cfg = replace(
+        prev if prev else Settings(request=start.get("request", ""), out=str(new_dir)),
+        out=str(new_dir),
+        judge=judge,
+        criteria=None,
+        prior_prompt=None,
+        resume_from=None,
+        start_index=1,
+        prompt=None,
+        request=start.get("request", ""),
+    )
+    RUN_STATE[new_id] = {
+        "dir": new_dir, "cancel": threading.Event(), "running": True, "cfg": cfg,
+        "source": new_dir / "source.png", "criteria": [],
+        "request": cfg.request, "judge": judge,
+        "last_image": None, "last_prompt": None, "last_iter": 0,
+    }
+    threading.Thread(target=_worker, args=(new_id, new_dir / "source.png", cfg),
+                     daemon=True).start()
+    return {"run_id": new_id, "judge": judge, "from": run_id}
+
+
+@app.get("/api/dataset")
+def dataset_stats() -> dict:
+    """What has been captured for training so far."""
+    path = ROOT / "training" / "dataset.jsonl"
+    if not path.exists():
+        return {"examples": 0, "kinds": {}, "teachers": {}, "training": TRAINING["running"],
+                "log": TRAINING["log"][-12:]}
+    kinds: dict[str, int] = {}
+    teachers: dict[str, int] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        d = json.loads(line)
+        kinds[d.get("kind", "?")] = kinds.get(d.get("kind", "?"), 0) + 1
+        t = d.get("source_judge", "?")
+        teachers[t] = teachers.get(t, 0) + 1
+    return {"examples": sum(kinds.values()), "kinds": kinds, "teachers": teachers,
+            "training": TRAINING["running"], "log": TRAINING["log"][-12:]}
+
+
+@app.post("/api/train/{run_id}")
+async def train(run_id: str) -> dict:
+    """Capture this run, then retrain the small judge on everything captured.
+
+    Deliberately trains on the whole dataset, not just this run: one run yields
+    a handful of examples and LoRA would simply memorise them.
+    """
+    if TRAINING["running"]:
+        raise HTTPException(409, "already training")
+    outdir = _run_dir(run_id)
+
+    import distill
+
+    added = distill.export([outdir])
+    TRAINING["log"] = [f"captured {added} example(s) from {run_id}"]
+    TRAINING["running"] = True
+
+    def run_training() -> None:
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-u", str(ROOT / "train.py")],
+                cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            for line in proc.stdout:  # type: ignore[union-attr]
+                line = line.rstrip()
+                if line and "it/s" not in line:
+                    TRAINING["log"].append(line[:200])
+                    del TRAINING["log"][:-200]
+            proc.wait()
+            TRAINING["log"].append(f"training exited with {proc.returncode}")
+        except Exception as exc:
+            TRAINING["log"].append(f"training failed: {type(exc).__name__}: {exc}")
+        finally:
+            TRAINING["running"] = False
+
+    threading.Thread(target=run_training, daemon=True).start()
+    return {"captured": added, "training": True}
 
 
 @app.post("/api/stop/{run_id}")
